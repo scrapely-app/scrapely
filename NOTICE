@@ -1,0 +1,12 @@
+scrapely
+Copyright (c) 2025-2026 TeraShift GmbH (Scrape.ly)
+
+Licensed under the ISC License (see LICENSE), except for the files below,
+which are derived from apify-sdk-js (https://github.com/apify/apify-sdk-js),
+Copyright Apify Technologies s.r.o., and remain under the Apache License,
+Version 2.0 (see LICENSE-APACHE). They have been modified by TeraShift GmbH:
+
+  - src/actor.ts
+  - src/charging.ts
+  - src/configuration.ts
+  - src/scrapely-proxy-configuration.ts
