@@ -21,7 +21,7 @@
 
 export const DEGRADED_STATUS_MESSAGE = 'Site protection temporarily unavailable, results may be incomplete';
 
-const COMPAT_SUFFIXES = ['/compat/v1', '/compat/xhrdev'];
+const COMPAT_SUFFIXES = ['/compat/v1'];
 const STATUS_TTL_MS = 15_000;
 const MAX_BODY = 4 * 1024 * 1024;
 const UNAVAILABLE_CODES = new Set(['vendor_degraded', 'vendor_down', 'provider_unavailable', 'vendor_unsupported', 'solver_not_enabled']);

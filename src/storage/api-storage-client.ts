@@ -21,6 +21,7 @@ import {
     makePaginatingKeysIterable,
     makePaginatingValuesIterable,
 } from './kvs-iteration.js';
+import { pathSegment } from './utils.js';
 
 /** Query params shared by request queue API calls. */
 interface RqQueryOptions {
@@ -862,14 +863,14 @@ export class ApiKeyValueStoreClient extends BaseApiClient implements KeyValueSto
     }
 
     async recordExists(key: string): Promise<boolean> {
-        return this.exists(`/key-value-stores/${this.id}/records/${key}`);
+        return this.exists(`/key-value-stores/${this.id}/records/${pathSegment(key)}`);
     }
 
     async getRecord(key: string, options?: KeyValueStoreClientGetRecordOptions): Promise<KeyValueStoreRecord | undefined> {
         try {
             const { data, contentType } = await this.requestWithHeaders<unknown>(
                 'GET',
-                `/key-value-stores/${this.id}/records/${key}`,
+                `/key-value-stores/${this.id}/records/${pathSegment(key)}`,
             );
 
             if (data === undefined || data === null) return undefined;
@@ -925,11 +926,11 @@ export class ApiKeyValueStoreClient extends BaseApiClient implements KeyValueSto
             doNotRetryTimeouts: (options as any).doNotRetryTimeouts,
         } : undefined;
 
-        await this.request('PUT', `/key-value-stores/${this.id}/records/${key}`, body, contentType || ct, requestOptions);
+        await this.request('PUT', `/key-value-stores/${this.id}/records/${pathSegment(key)}`, body, contentType || ct, requestOptions);
     }
 
     async deleteRecord(key: string): Promise<void> {
-        await this.request('DELETE', `/key-value-stores/${this.id}/records/${key}`);
+        await this.request('DELETE', `/key-value-stores/${this.id}/records/${pathSegment(key)}`);
     }
 
     async listKeys(options?: KeyValueStoreClientListOptions): Promise<KeyValueStoreClientListData> {
@@ -1001,7 +1002,7 @@ export class ApiKeyValueStoreClient extends BaseApiClient implements KeyValueSto
         // apiUrl is the container-internal API address; links handed to users
         // must use the public base URL the platform injects.
         const publicBase = (process.env.APIFY_API_PUBLIC_BASE_URL || process.env.ACTOR_API_PUBLIC_BASE_URL || this.config.apiUrl).replace(/\/+$/, '');
-        return `${publicBase}/v2/key-value-stores/${this.id}/records/${key}`;
+        return `${publicBase}/v2/key-value-stores/${this.id}/records/${pathSegment(key)}`;
     }
 }
 
@@ -1076,7 +1077,7 @@ export class ApiRequestQueueClient extends BaseApiClient implements RequestQueue
 
     async getRequest(id: string): Promise<RequestOptions | undefined> {
         try {
-            return await this.request<RequestOptions>('GET', `/request-queues/${this.id}/requests/${id}`);
+            return await this.request<RequestOptions>('GET', `/request-queues/${this.id}/requests/${pathSegment(id)}`);
         } catch {
             return undefined;
         }
@@ -1086,13 +1087,13 @@ export class ApiRequestQueueClient extends BaseApiClient implements RequestQueue
         const query = buildRqQueryParams(this.clientKey, { forefront: options?.forefront });
         return this.request<QueueOperationInfo>(
             'PUT',
-            `/request-queues/${this.id}/requests/${request.id}${query}`,
+            `/request-queues/${this.id}/requests/${pathSegment(request.id)}${query}`,
             request,
         );
     }
 
     async deleteRequest(id: string): Promise<void> {
-        await this.request('DELETE', `/request-queues/${this.id}/requests/${id}`);
+        await this.request('DELETE', `/request-queues/${this.id}/requests/${pathSegment(id)}`);
     }
 
     async listHead(options?: ListOptions): Promise<QueueHead> {
@@ -1135,14 +1136,14 @@ export class ApiRequestQueueClient extends BaseApiClient implements RequestQueue
         });
         const result = await this.request<{ lockExpiresAt: string }>(
             'PUT',
-            `/request-queues/${this.id}/requests/${id}/lock${query}`,
+            `/request-queues/${this.id}/requests/${pathSegment(id)}/lock${query}`,
         );
         return { lockExpiresAt: new Date(result.lockExpiresAt) };
     }
 
     async deleteRequestLock(id: string, options?: DeleteRequestLockOptions): Promise<void> {
         const query = buildRqQueryParams(this.clientKey, { forefront: options?.forefront });
-        await this.request('DELETE', `/request-queues/${this.id}/requests/${id}/lock${query}`);
+        await this.request('DELETE', `/request-queues/${this.id}/requests/${pathSegment(id)}/lock${query}`);
     }
 
     /**

@@ -6,7 +6,7 @@ import type {
 } from '@crawlee/types';
 import { Readable } from 'node:stream';
 import type { DragonflyClient } from './dragonfly-client.js';
-import { nowISO } from './utils.js';
+import { nowISO, pathSegment } from './utils.js';
 import { BillingTracker } from './billing-tracker.js';
 import { Configuration } from '../configuration.js';
 import {
@@ -361,6 +361,6 @@ export class DragonflyKeyValueStoreClient implements KeyValueStoreClient {
     getPublicUrl(key: string): string {
         const config = Configuration.getGlobalConfig();
         const baseUrl = config.get('apiPublicBaseUrl') || config.get('apiBaseUrl') || 'https://api.scrape.ly';
-        return `${baseUrl}/v2/key-value-stores/${this.id}/records/${key}`;
+        return `${baseUrl}/v2/key-value-stores/${this.id}/records/${pathSegment(key)}`;
     }
 }

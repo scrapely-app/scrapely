@@ -432,9 +432,24 @@ export class ChargingManager {
     private lastAcceptedOperationId: string | undefined;
     /** Voids not yet confirmed by the platform; retried before the next push and at exit. */
     private pendingVoids: Array<{ eventName: string; operationId: string; reservedCount: number; notFoundMeansVoided?: boolean }> = [];
+    /**
+     * @internal Platform charges for results that were not stored and that the
+     * platform definitively refused to void (event -> count). They stay billed,
+     * so the next push of that event uses them instead of charging again.
+     */
+    _voidRefusedCredit: Record<string, number> = {};
 
     /** Unresolved platform POSTs: key = idempotency UUID (never event name). */
     private readonly pendingCharges = new Map<string, PendingChargeIntent>();
+    /**
+     * Record in the run's default key-value store that mirrors pendingCharges,
+     * so a container crash does not lose them: settlement re-applies them under
+     * their own idempotency keys. One record per container, so a restarted
+     * container never overwrites its predecessor's.
+     */
+    private readonly pendingRecordKey = `SCRAPELY_PENDING_CHARGES-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    /** Intent keys last written to that record ('' = nothing written / empty). */
+    private persistedPendingSig = '';
     private flushInFlight: Promise<number> | null = null;
     private operationTail: Promise<void> = Promise.resolve();
     private readonly postAttempts = POST_ATTEMPTS;
@@ -905,6 +920,36 @@ export class ChargingManager {
     }
 
     /**
+     * @internal Mirror the unconfirmed charges to the run's default key-value
+     * store (best effort, only when the set changed since the last write).
+     */
+    async _persistPendingCharges(): Promise<void> {
+        if (!this.isAtHome || !this.actorRunId) return;
+        const intents = [...this.pendingCharges.values()].map(({ idempotencyKey, eventName, count, createdAt }) => ({ idempotencyKey, eventName, count, createdAt }));
+        const sig = intents.map((i) => i.idempotencyKey).sort().join(',');
+        if (sig === this.persistedPendingSig) return;
+        const storeId = process.env.ACTOR_DEFAULT_KEY_VALUE_STORE_ID
+            || process.env.APIFY_DEFAULT_KEY_VALUE_STORE_ID
+            || (this.configuration.get('defaultKeyValueStoreId') as string | undefined);
+        if (!storeId || storeId === 'default') return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const store = (this.apifyClient as unknown as {
+                keyValueStore(id: string): { setRecord(r: { key: string; value: unknown }): Promise<unknown> };
+            }).keyValueStore(storeId);
+            await Promise.race([
+                store.setRecord({ key: this.pendingRecordKey, value: { v: 1, intents } }),
+                new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timed out')), 15_000); }),
+            ]);
+            this.persistedPendingSig = sig;
+        } catch (err) {
+            console.warn(`[Scrapely] Could not persist ${intents.length} unconfirmed charge(s): ${(err as Error).message}`);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    /**
      * @internal Reverse an accepted charge whose items were never stored
      * (POST /v2/actor-runs/:runId/charge/void), then unwind the local
      * reservation. Returns true when the platform voided it.
@@ -917,7 +962,56 @@ export class ChargingManager {
      */
     async _cancelUncertainCharge(eventName: string, operationId: string, reservedCount: number): Promise<boolean> {
         this.pendingCharges.delete(operationId);
-        return this._voidCharge(eventName, operationId, reservedCount, true);
+        const voided = await this._voidCharge(eventName, operationId, reservedCount, true);
+        // A persisted copy is harmless either way (the void leaves a tombstone),
+        // but keep the record small.
+        await this._persistPendingCharges();
+        return voided;
+    }
+
+    /**
+     * @internal Void (or cancel, when unconfirmed) a whole charge and say what
+     * happened: 'voided' (confirmed, local reservation released), 'stands' (a
+     * definitive answer that it cannot be voided) or 'unknown' (queued for retry,
+     * reservation kept).
+     */
+    async _voidOutcome(eventName: string, operationId: string, reservedCount: number, uncertain: boolean): Promise<'voided' | 'stands' | 'unknown'> {
+        const queued = this.pendingVoids.length;
+        const ok = uncertain
+            ? await this._cancelUncertainCharge(eventName, operationId, reservedCount)
+            : await this._voidCharge(eventName, operationId, reservedCount);
+        if (ok) return 'voided';
+        return this.pendingVoids.length > queued ? 'unknown' : 'stands';
+    }
+
+    /** @internal A charge for `count` unstored results stands (void refused): keep it as credit. */
+    _noteUnvoidable(eventName: string, count: number): void {
+        if (count <= 0) return;
+        this._voidRefusedCredit[eventName] = (this._voidRefusedCredit[eventName] ?? 0) + count;
+        console.warn(
+            `[Scrapely] Charge for ${count} unstored '${eventName}' result(s) could not be voided; ` +
+                `the next push of '${eventName}' uses it instead of charging again`,
+        );
+    }
+
+    /** @internal Use credit for a whole charge of `count` events (all or nothing); returns the count used. */
+    _takeVoidCredit(eventName: string, count: number): number {
+        const have = this._voidRefusedCredit[eventName] ?? 0;
+        if (count <= 0 || have < count) return 0;
+        this._voidRefusedCredit[eventName] = have - count;
+        return count;
+    }
+
+    /** @internal */
+    _returnVoidCredit(eventName: string, count: number): void {
+        if (count > 0) this._voidRefusedCredit[eventName] = (this._voidRefusedCredit[eventName] ?? 0) + count;
+    }
+
+    /** @internal Void (or cancel) a charge for results that were not stored; a refused void becomes credit. */
+    async _voidOrCredit(eventName: string, operationId: string, reservedCount: number, uncertain: boolean): Promise<'voided' | 'stands' | 'unknown'> {
+        const outcome = await this._voidOutcome(eventName, operationId, reservedCount, uncertain);
+        if (outcome === 'stands') this._noteUnvoidable(eventName, reservedCount);
+        return outcome;
     }
 
     async _voidCharge(
@@ -1078,6 +1172,7 @@ export class ChargingManager {
                 // No progress and still pending → stop to avoid tight loop on uncertain.
                 if (confirmed === 0) break;
             }
+            await this._persistPendingCharges();
             return confirmedTotal;
         })();
 
@@ -1228,6 +1323,9 @@ export class ChargingManager {
                 );
                 this.syncPlatformBudget();
             } else {
+                // Not confirmed: keep a durable copy so a crash before the next
+                // flush cannot lose it (settlement re-applies it).
+                await this._persistPendingCharges();
                 throw new ChargeUncertainError(
                     `Charge for event '${normalizedEventName}' (count=${chargedCount}) was not confirmed by the platform; operationId=${intent.idempotencyKey}`,
                     {
@@ -1330,6 +1428,11 @@ function classifyChargeHttpError(
         );
     }
 
+    // A 5xx / 408 / 429 answer is never a definitive rejection, whatever its text
+    // says: the charge may have applied, and only a retry with the same
+    // Idempotency-Key can tell (classifying it as rejected unwound the local
+    // count and the caller charged again under a new key).
+    if (status !== undefined && isTransientStatus(status)) return null;
     const message = String((err as Error)?.message ?? err ?? '');
     if (
         /charge-limit-exceeded|unknown-event|ledger-sealed|invalid-input|conflict/i.test(message)
@@ -1345,18 +1448,57 @@ function classifyChargeHttpError(
     return null;
 }
 
+/**
+ * @internal Fail before anything is charged when an item cannot be serialized
+ * for the dataset (circular reference, BigInt, a bare function or undefined):
+ * the push would otherwise fail after the charge, with nothing stored.
+ */
+export function assertItemsSerializable(items: unknown[]): void {
+    items.forEach((item, index) => {
+        let json: string | undefined;
+        try {
+            json = JSON.stringify(item);
+        } catch (err) {
+            throw new Error(`Dataset item at index ${index} is not serializable to JSON: ${(err as Error).message}`);
+        }
+        if (json === undefined) throw new Error(`Dataset item at index ${index} is not serializable to JSON`);
+    });
+}
+
+// Credit / void helpers that also work with partial managers (tests, older shims).
+const takeVoidCredit = (m: ChargingManager, name: string, count: number): number =>
+    isSyntheticEvent(name) ? 0 : (m._takeVoidCredit?.(name, count) ?? 0);
+const returnVoidCredit = (m: ChargingManager, name: string, count: number): void => m._returnVoidCredit?.(name, count);
+async function voidOrCredit(
+    m: ChargingManager,
+    name: string,
+    operationId: string,
+    reserved: number,
+    uncertain: boolean,
+    creditIfStands = true,
+): Promise<'voided' | 'stands' | 'unknown'> {
+    if (creditIfStands && m._voidOrCredit) return m._voidOrCredit(name, operationId, reserved, uncertain);
+    if (m._voidOutcome) return m._voidOutcome(name, operationId, reserved, uncertain);
+    if (uncertain) await m._cancelUncertainCharge?.(name, operationId, reserved);
+    else await m._voidCharge(name, operationId, reserved);
+    return 'voided';
+}
+
 export async function pushDataAndCharge<T>({
     chargingManager,
     items,
     eventName,
     isDefaultDataset,
     pushFn,
+    validateItems,
 }: {
     chargingManager: ChargingManager;
     items: T | T[];
     eventName: string | undefined;
     isDefaultDataset: boolean;
     pushFn: (limitedItems: T | T[]) => Promise<void>;
+    /** Extra checks the storage would make after the charge (e.g. crawlee's object / size rules). */
+    validateItems?: (items: T[]) => void;
 }): Promise<ChargeResult> {
     return chargingManager._withOperationLock(async () => {
         if (chargingManager.isClosed()) {
@@ -1431,6 +1573,9 @@ export async function pushDataAndCharge<T>({
         // items in the dataset. Operation lock is held across both steps.
         let chargeResult: ChargeResult | undefined;
         if (Object.keys(eventsToCharge).length > 0) {
+            // An item the storage would refuse fails here, before it is charged.
+            assertItemsSerializable(limitedItems);
+            validateItems?.(limitedItems as T[]);
             const results: ChargeResult[] = [];
             // Synthetic/default-dataset events first (local-only); then explicit.
             const ordered = Object.entries(eventsToCharge).sort(([a], [b]) => {
@@ -1438,10 +1583,33 @@ export async function pushDataAndCharge<T>({
                 const bSyn = isSyntheticEvent(b) ? 0 : 1;
                 return aSyn - bSyn;
             });
-            const reservedInOp: Array<{ name: string; reserved: number; operationId?: string; uncertain?: boolean }> = [];
+            // credit: events of this push paid from credit (an earlier charge that could not be voided).
+            const reservedInOp: Array<{ name: string; reserved: number; operationId?: string; uncertain?: boolean; credit?: number }> = [];
+            // Undo charge i of this operation: void a platform charge, unwind a local
+            // one, give credit back. A refused void becomes credit (its results were
+            // not stored) unless the caller handles that itself (creditIfStands=false).
+            const undoOp = async (i: number, creditIfStands = true): Promise<'voided' | 'stands' | 'unknown'> => {
+                const entry = reservedInOp[i]!;
+                const { name, reserved, operationId, uncertain } = entry;
+                if (reserved <= 0) return 'voided';
+                if (entry.credit) {
+                    returnVoidCredit(chargingManager, name, entry.credit);
+                    entry.credit = 0;
+                    return 'voided';
+                }
+                if (operationId) return voidOrCredit(chargingManager, name, operationId, reserved, !!uncertain, creditIfStands);
+                chargingManager.applyAcceptedCount(name, reserved, 0);
+                return 'voided';
+            };
             try {
                 for (const [name, chargeCount] of ordered) {
                     chargingManager._takeLastAcceptedOperationId?.();
+                    const credit = takeVoidCredit(chargingManager, name, chargeCount);
+                    if (credit > 0) {
+                        results.push({ eventChargeLimitReached: false, chargedCount: credit, chargeableWithinLimit: chargingManager._chargeableWithinLimit?.() ?? {} });
+                        reservedInOp.push({ name, reserved: credit, credit });
+                        continue;
+                    }
                     let r: ChargeResult;
                     try {
                         r = await chargingManager._chargeExclusive({
@@ -1470,14 +1638,58 @@ export async function pushDataAndCharge<T>({
                     reservedInOp.push({ name, reserved: r.chargedCount, operationId: chargingManager._takeLastAcceptedOperationId?.() });
                 }
             } catch (err) {
-                // Uncertain/failure after partial multi-event reserve: unwind all
-                // prior reservations for this operation (synthetic + explicit).
-                for (const { name, reserved } of reservedInOp) {
-                    if (reserved > 0) {
-                        chargingManager.applyAcceptedCount(name, reserved, 0);
-                    }
-                }
+                // Failure after a partial multi-event reserve: undo every prior
+                // charge of this operation, voiding the ones the platform accepted
+                // (not only unwinding them locally).
+                for (let i = 0; i < reservedInOp.length; i++) await undoOp(i);
                 throw err;
+            }
+            // One platform event accepted more than another: only the smaller
+            // count of items is stored, so the larger platform charge is voided
+            // and charged again for exactly that count. A charge that cannot be
+            // voided (definitive answer) stays as before; one whose void is not
+            // confirmed yet fails the push so the caller retries it.
+            // (Today a push posts at most one platform event; this keeps it
+            // correct if that changes.)
+            const stood = new Set<number>();
+            for (let round = 0; round < 3; round++) {
+                const acceptedNow = Math.min(limitedItems.length, ...results.map((r) => r.chargedCount));
+                const excess = results
+                    .map((r, i) => i)
+                    .filter((i) => reservedInOp[i]?.operationId && !stood.has(i) && results[i]!.chargedCount > acceptedNow);
+                if (acceptedNow <= 0 || excess.length === 0) break;
+                for (const i of excess) {
+                    const name = reservedInOp[i]!.name;
+                    // A refused void here keeps its stored share; the rest becomes credit below.
+                    const outcome = await undoOp(i, false);
+                    if (outcome === 'stands') {
+                        stood.add(i);
+                        continue;
+                    }
+                    if (outcome === 'unknown') {
+                        for (let j = 0; j < reservedInOp.length; j++) if (j !== i) await undoOp(j);
+                        throw new Error('[Scrapely] An earlier charge for a failed dataset push could not be voided yet; retry the push');
+                    }
+                    chargingManager._takeLastAcceptedOperationId?.();
+                    let r: ChargeResult;
+                    let operationId: string | undefined;
+                    let uncertain = false;
+                    try {
+                        r = await chargingManager._chargeExclusive({ eventName: name, count: acceptedNow });
+                        operationId = chargingManager._takeLastAcceptedOperationId?.();
+                    } catch (chargeErr) {
+                        if (!(chargeErr instanceof ChargeUncertainError)) throw chargeErr;
+                        r = {
+                            eventChargeLimitReached: false,
+                            chargedCount: chargeErr.count,
+                            chargeableWithinLimit: chargingManager._chargeableWithinLimit?.() ?? {},
+                        };
+                        operationId = chargeErr.operationId;
+                        uncertain = true;
+                    }
+                    results[i] = r;
+                    reservedInOp[i] = { name, reserved: r.chargedCount, operationId, uncertain };
+                }
             }
             // Persist only what every charged event accepted.
             // When multiple events are charged for the same items, use the
@@ -1499,7 +1711,20 @@ export async function pushDataAndCharge<T>({
                     // count to the void below, which releases it only once the
                     // platform confirms (never on a server without the void route).
                     const platformOp = acceptedForItems <= 0 && reservedInOp[i]?.operationId;
-                    if (!platformOp) chargingManager.applyAcceptedCount(name, reserved, acceptedForItems);
+                    if (!platformOp) {
+                        const entry = reservedInOp[i]!;
+                        let over = reserved - acceptedForItems;
+                        const back = Math.min(over, entry.credit ?? 0);
+                        if (back > 0) {
+                            returnVoidCredit(chargingManager, name, back);
+                            entry.credit = (entry.credit ?? 0) - back;
+                            entry.reserved -= back;
+                            over -= back;
+                        }
+                        // The platform refused to void it: the unstored share stays billed.
+                        if (over > 0 && stood.has(i)) chargingManager._noteUnvoidable?.(name, over);
+                        else if (over > 0) chargingManager.applyAcceptedCount(name, acceptedForItems + over, acceptedForItems);
+                    }
                     results[i] = {
                         ...results[i]!,
                         chargedCount: acceptedForItems,
@@ -1519,12 +1744,18 @@ export async function pushDataAndCharge<T>({
                 // zero): undo every platform charge this operation made, so no
                 // result is billed for items that are never saved.
                 for (let i = 0; i < reservedInOp.length; i++) {
-                    const { name, operationId, uncertain, reserved } = reservedInOp[i]!;
+                    const entry = reservedInOp[i]!;
+                    const { name, operationId, uncertain } = entry;
+                    let { reserved } = entry;
+                    if (entry.credit) {
+                        returnVoidCredit(chargingManager, name, entry.credit);
+                        reserved -= entry.credit;
+                        entry.credit = 0;
+                    }
                     if (reserved <= 0 || !operationId) continue;
                     // Original count: the local reservation is released only when
                     // the platform confirms the void (or that it never applied).
-                    if (uncertain) await chargingManager._cancelUncertainCharge?.(name, operationId, reserved);
-                    else await chargingManager._voidCharge(name, operationId, reserved);
+                    await voidOrCredit(chargingManager, name, operationId, reserved, !!uncertain);
                 }
                 return {
                     eventChargeLimitReached: true,
@@ -1552,14 +1783,20 @@ export async function pushDataAndCharge<T>({
                 // the charge stands for those (they may be in the dataset).
                 if (!pushCertainlyFailed(pushErr)) throw pushErr;
                 for (let i = 0; i < reservedInOp.length; i++) {
-                    const { name, operationId, uncertain } = reservedInOp[i]!;
-                    const reserved = results[i]!.chargedCount;
+                    const entry = reservedInOp[i]!;
+                    const { name, operationId, uncertain } = entry;
+                    let reserved = results[i]!.chargedCount;
+                    if (entry.credit) {
+                        const back = Math.min(reserved, entry.credit);
+                        returnVoidCredit(chargingManager, name, back);
+                        entry.credit -= back;
+                        reserved -= back;
+                    }
                     if (reserved <= 0) continue;
-                    if (operationId && uncertain) {
-                        // Never re-post a charge for items that were not stored.
-                        await chargingManager._cancelUncertainCharge?.(name, operationId, reserved);
-                    } else if (operationId) {
-                        await chargingManager._voidCharge(name, operationId, reserved);
+                    if (operationId) {
+                        // An unconfirmed charge is cancelled (never re-posted for items
+                        // that were not stored); a refused void becomes credit.
+                        await voidOrCredit(chargingManager, name, operationId, reserved, !!uncertain);
                     } else if (isSyntheticEvent(name)) {
                         chargingManager.applyAcceptedCount(name, reserved, 0);
                     }
@@ -1613,6 +1850,7 @@ export async function pushDataWithCharges<T>({
     isDefaultDataset,
     pushFn,
     chargePer = 'row',
+    validateItems,
 }: {
     chargingManager: ChargingManager;
     items: T | T[];
@@ -1621,6 +1859,8 @@ export async function pushDataWithCharges<T>({
     pushFn: (rows: T | T[]) => Promise<void>;
     /** 'batch': charge `charges` once for the whole push; all rows stored if accepted, none if refused. */
     chargePer?: 'row' | 'batch';
+    /** Extra checks the storage would make after the charge (e.g. crawlee's object / size rules). */
+    validateItems?: (items: T[]) => void;
 }): Promise<ChargeResult> {
     const perRowIn = validateRowCharges(charges);
     if (chargePer !== 'row' && chargePer !== 'batch') throw new Error("chargePer must be 'row' or 'batch'");
@@ -1652,13 +1892,19 @@ export async function pushDataWithCharges<T>({
             throw new Error('[Scrapely] An earlier charge for a failed dataset push could not be voided yet; retry the push');
         }
 
-        type Op = { name: string; charged: number; operationId?: string; uncertain: boolean };
+        // An item the storage would refuse fails here, before it is charged.
+        assertItemsSerializable(rowsIn);
+        validateItems?.(rowsIn);
+
+        // credit: paid by an earlier charge whose results were not stored (void refused).
+        type Op = { name: string; charged: number; operationId?: string; uncertain: boolean; credit?: boolean };
         const undo = async (ops: Op[]) => {
             for (const op of ops) {
                 if (op.charged <= 0) continue;
-                if (!op.operationId) chargingManager.applyAcceptedCount(op.name, op.charged, 0);
-                else if (op.uncertain) await chargingManager._cancelUncertainCharge(op.name, op.operationId, op.charged);
-                else await chargingManager._voidCharge(op.name, op.operationId, op.charged);
+                if (op.credit) returnVoidCredit(chargingManager, op.name, op.charged);
+                else if (!op.operationId) chargingManager.applyAcceptedCount(op.name, op.charged, 0);
+                // Cancel / void; a refused void stays billed and becomes credit.
+                else await voidOrCredit(chargingManager, op.name, op.operationId, op.charged, op.uncertain);
             }
         };
         const order = Object.entries(perRow).sort(([a], [b]) => Number(isSyntheticEvent(a)) - Number(isSyntheticEvent(b)) || a.localeCompare(b));
@@ -1670,18 +1916,23 @@ export async function pushDataWithCharges<T>({
                 const want = n * rows;
                 chargingManager._takeLastAcceptedOperationId?.();
                 let got: number;
-                try {
-                    const r = await chargingManager._chargeExclusive({ eventName: name, count: want });
-                    got = r.chargedCount;
-                    ops.push({ name, charged: got, operationId: chargingManager._takeLastAcceptedOperationId?.(), uncertain: false });
-                } catch (err) {
-                    if (!(err instanceof ChargeUncertainError)) {
-                        await undo(ops);
-                        throw err;
+                if (takeVoidCredit(chargingManager, name, want) > 0) {
+                    got = want;
+                    ops.push({ name, charged: want, uncertain: false, credit: true });
+                } else {
+                    try {
+                        const r = await chargingManager._chargeExclusive({ eventName: name, count: want });
+                        got = r.chargedCount;
+                        ops.push({ name, charged: got, operationId: chargingManager._takeLastAcceptedOperationId?.(), uncertain: false });
+                    } catch (err) {
+                        if (!(err instanceof ChargeUncertainError)) {
+                            await undo(ops);
+                            throw err;
+                        }
+                        // Not confirmed: stays pending and is re-posted at exit, so it counts as accepted.
+                        got = err.count;
+                        ops.push({ name, charged: got, operationId: err.operationId, uncertain: true });
                     }
-                    // Not confirmed: stays pending and is re-posted at exit, so it counts as accepted.
-                    got = err.count;
-                    ops.push({ name, charged: got, operationId: err.operationId, uncertain: true });
                 }
                 if (got < want) {
                     shortTo = Math.floor(got / n);

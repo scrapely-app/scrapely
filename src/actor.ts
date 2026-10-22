@@ -982,6 +982,7 @@ export class Actor {
                     chargePer: opts.chargePer ?? 'row',
                     isDefaultDataset,
                     pushFn: async (rows) => { await dataset.pushData(rows); },
+                    validateItems: await crawleeItemValidator(),
                 });
             }
             if (opts.chargePer !== undefined && opts.chargePer !== 'row') throw new Error("chargePer needs charges: {...}");
@@ -1000,6 +1001,7 @@ export class Actor {
                 eventName: opts.eventName,
                 isDefaultDataset: false,
                 pushFn: async (rows) => { await dataset.pushData(rows); },
+                validateItems: await crawleeItemValidator(),
             });
         }
         const eventName = eventNameOrOptions;
@@ -1083,6 +1085,7 @@ export class Actor {
             eventName: explicitEventName,
             isDefaultDataset,
             pushFn: async (limitedItems) => dataset.pushData(limitedItems),
+            validateItems: await crawleeItemValidator(),
         });
     }
 
@@ -1120,7 +1123,15 @@ export class Actor {
     }
 
     private static _debugCaptureCount = 0;
+    /**
+     * A payload up to DEBUG_CAPTURE_MAX_BYTES characters is stored as it is; a larger one gzip-compressed
+     * (base64, at most DEBUG_CAPTURE_MAX_BYTES characters again), keeping up to DEBUG_CAPTURE_MAX_CHARS
+     * characters / DEBUG_CAPTURE_MAX_ENCODED bytes of it. A plain cut at 256 KiB lost the part a check
+     * needed when a large API document starts with site navigation.
+     */
     static readonly DEBUG_CAPTURE_MAX_BYTES = 256 * 1024;
+    static readonly DEBUG_CAPTURE_MAX_CHARS = 8 * 1024 * 1024;
+    static readonly DEBUG_CAPTURE_MAX_ENCODED = 8 * 1024 * 1024;
     static readonly DEBUG_CAPTURE_MAX_RECORDS = 500;
 
     /** The key-value store record name for a capture key (item URL or id). */
@@ -1144,12 +1155,30 @@ export class Actor {
         if (process.env.SCRAPELY_DEBUG_CAPTURE !== '1' || !key) return;
         if (Actor._debugCaptureCount >= Actor.DEBUG_CAPTURE_MAX_RECORDS) return;
         try {
-            const text = (typeof payload === 'string' ? payload : JSON.stringify(payload) ?? '').slice(0, Actor.DEBUG_CAPTURE_MAX_BYTES);
+            const text = typeof payload === 'string' ? payload
+                : payload instanceof Uint8Array ? Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8')
+                    : JSON.stringify(payload) ?? '';
+            const record = await Actor.debugCaptureRecord(String(key), text);
             Actor._debugCaptureCount++;
-            await Actor.setValue(await Actor.debugCaptureRecordKey(key), { key: String(key), payload: text });
+            await Actor.setValue(await Actor.debugCaptureRecordKey(key), record);
         } catch {
             // never break the run
         }
+    }
+
+    /** The record for one capture: plain when small, else gzip-base64 (plain head as the last resort). */
+    static async debugCaptureRecord(key: string, text: string): Promise<Record<string, unknown>> {
+        const limit = Actor.DEBUG_CAPTURE_MAX_BYTES;
+        if (text.length <= limit) return { key, payload: text };
+        const { gzipSync } = await import('node:zlib');
+        const raw = Buffer.from(text.slice(0, Actor.DEBUG_CAPTURE_MAX_CHARS), 'utf8');
+        const kept = raw.subarray(0, Actor.DEBUG_CAPTURE_MAX_ENCODED);
+        const packed = gzipSync(kept, { level: 6 }).toString('base64');
+        if (packed.length <= limit) {
+            const truncated = text.length > Actor.DEBUG_CAPTURE_MAX_CHARS || kept.length < raw.length;
+            return { key, payload: packed, encoding: 'gzip-base64', length: text.length, truncated };
+        }
+        return { key, payload: text.slice(0, limit), length: text.length, truncated: true };
     }
 
     /**
@@ -1917,12 +1946,10 @@ export class Actor {
             );
         }
 
-        // Wire format (server contract, Python SDK parity): the server copies the
-        // current INPUT to INPUT-METAMORPH-<n> itself and tracks the metamorph
-        // count in run stats; the new input (if any) is read from the request
-        // body's `input` field and written to INPUT. `inputKey` is NOT part of
-        // the contract — the old client-side KVS write made the server overwrite
-        // our value with the stale INPUT, silently losing the new input.
+        // Wire format (server contract, Python SDK parity): the new input (if
+        // any) goes in the request body's `input` field; the server stores it as
+        // INPUT-METAMORPH-<n> (INPUT keeps the original) and tracks the metamorph
+        // count in run stats. `inputKey` is NOT part of the contract.
         const body: Record<string, any> = { targetActorId };
         if (options?.build) {
             body.build = options.build;
@@ -2326,4 +2353,19 @@ export async function waitForStdioDrain(maxMs: number, streams: NodeJS.WritableS
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([drained, new Promise<void>((resolve) => { timer = setTimeout(resolve, maxMs); })]);
     if (timer) clearTimeout(timer);
+}
+
+/**
+ * Crawlee's own item rules (an object, serializable, at most ~9 MB), checked
+ * before a charge: Dataset.pushData would refuse such an item only after it
+ * was charged. Undefined when this crawlee version does not export the check.
+ */
+async function crawleeItemValidator(): Promise<((items: unknown[]) => void) | undefined> {
+    const core = (await import('@crawlee/core')) as { checkAndSerialize?: (item: unknown, limitBytes: number, index?: number) => string };
+    const check = core.checkAndSerialize;
+    if (typeof check !== 'function') return undefined;
+    // Same limit as Dataset.pushData (MAX_PAYLOAD_SIZE_BYTES minus its 0.01% safety buffer).
+    const max = 9 * 1024 * 1024;
+    const limit = max - Math.ceil(max * 0.0001);
+    return (items) => items.forEach((item, index) => check(item, limit, index));
 }

@@ -15,10 +15,14 @@ export class DragonflyKeyValueStoreCollectionClient implements KeyValueStoreColl
 
         const id = generateId();
         const now = nowISO();
+        // Derive ownership from the active billing context (as the request-queue
+        // client does); the server authorizes against this persisted field.
+        // The legacy '1' placeholder applies only when no context is present.
+        const userId = this.client.billingContext?.userId ?? '1';
         const data: KeyValueStoreInfo = {
             id,
             name,
-            userId: '1',
+            userId,
             createdAt: now,
             modifiedAt: now,
             accessedAt: now,
@@ -34,7 +38,7 @@ export class DragonflyKeyValueStoreCollectionClient implements KeyValueStoreColl
         await this.client.redis.hset(infoKey, {
             id,
             name: name ?? '',
-            userId: '1',
+            userId,
             createdAt: now.toISOString(),
             modifiedAt: now.toISOString(),
             accessedAt: now.toISOString(),
