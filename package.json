@@ -1,6 +1,6 @@
 {
     "name": "scrapely",
-    "version": "1.2.36",
+    "version": "1.2.37",
     "description": "Scrapely SDK for building JavaScript and TypeScript Actors",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",

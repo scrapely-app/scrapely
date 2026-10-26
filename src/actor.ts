@@ -464,6 +464,13 @@ export class Actor {
      */
     private _lifecycleStarted = false;
 
+    /**
+     * Set by {@link Actor.fail} for the rest of the run: a later {@link Actor.exit}
+     * keeps the failure's exit code and status message, so a failed run never
+     * ends as SUCCEEDED (e.g. `fail({ exit: false })` followed by `exit()`).
+     */
+    private static _failure: { exitCode: number; statusMessage?: string } | undefined;
+
     /** Created on first use: scrapely-client is only loaded when something needs the API client. */
     private _apifyClient: ApifyClient | undefined;
     private readonly chargingManager: ChargingManager;
@@ -552,6 +559,7 @@ export class Actor {
     async init(options: InitOptions = {}): Promise<void> {
         if (this.initialized) return;
         cachedInput = undefined; // a fresh init reads this run's input again
+        Actor._failure = undefined; // a new lifecycle starts unfailed
         // NOTE: `initialized` is set at the END of init — a failed platform init
         // must stay retryable instead of leaving a half-initialized Actor.
         Actor.installFatalChargeHandlers();
@@ -762,7 +770,8 @@ export class Actor {
             const result = await userFunc();
             await Actor._shutdownActor(options?.timeoutSecs ?? 30);
             await new Promise<void>((resolve) => process.stdout.write('', () => resolve()));
-            process.exit(options?.exitCode ?? 0);
+            // A run that called fail({ exit: false }) stays failed.
+            process.exit(Actor._failure?.exitCode ?? options?.exitCode ?? 0);
             return result;
         } catch (err) {
             const cause = (err as any).cause;
@@ -793,11 +802,23 @@ export class Actor {
                 ? { ...options, statusMessage: messageOrOptions }
                 : { ...messageOrOptions, ...options };
 
+        Actor._ensureActorInit('exit');
+
+        const failure = Actor._failure;
+        if (failure) {
+            // Actor.fail() already ran: the run stays failed. Keep its exit code and
+            // status message; this exit() only finishes the shutdown.
+            if (opts.statusMessage) console.log(`[Scrapely] ${opts.statusMessage}`);
+            console.log(`[Scrapely] Actor.exit() after Actor.fail(): the run stays failed (exit code ${failure.exitCode}).`);
+            return Actor._exitWith({ ...opts, exitCode: failure.exitCode, statusMessage: undefined });
+        }
+        return Actor._exitWith(opts);
+    }
+
+    private static async _exitWith(opts: ExitOptions): Promise<void> {
         const code = opts.exitCode ?? 0;
         const timeoutSecs = opts.timeoutSecs ?? 30;
         const shouldExit = opts.exit ?? true;
-
-        Actor._ensureActorInit('exit');
 
         // The exit/fail message becomes the run's terminal status
         // message. Stored before teardown, while the run and process are alive.
@@ -818,7 +839,13 @@ export class Actor {
                 : { exitCode: 1, ...messageOrOptions, ...options };
         console.error(`[Scrapely] Actor failed: ${opts.statusMessage ?? 'Unknown error'}`);
         await new Promise<void>((resolve) => process.stderr.write('', () => resolve()));
-        await Actor.exit(opts);
+        Actor._ensureActorInit('fail');
+        if (Actor._failure) {
+            // Failed already: the first failure's code and message stay.
+            return Actor._exitWith({ ...opts, exitCode: Actor._failure.exitCode, statusMessage: undefined });
+        }
+        Actor._failure = { exitCode: opts.exitCode ?? 1, statusMessage: opts.statusMessage };
+        await Actor._exitWith({ ...opts, exitCode: opts.exitCode ?? 1 });
     }
 
     static async getInput<T = ActorInput>(): Promise<T | null> {

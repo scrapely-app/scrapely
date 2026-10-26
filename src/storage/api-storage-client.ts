@@ -183,18 +183,21 @@ const CONNECT_FAILURE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
 /**
  * Whether a non-2xx answer is retried. 429 always: the run API limiter and
  * dataset backpressure refuse it before anything is written. Idempotent
- * methods: also 500/502/503/504. Others (dataset push, KV PUT) only on a 503
- * that certainly was not processed: the rate limiter refused it
- * ("rate-limit-unavailable", before the handler), or HAProxy had no backend
- * (its own page, nothing forwarded). Any other 503 may mean "outcome unknown"
- * (e.g. a direct dataset write whose commit was not confirmed), and re-sending
- * could store the items twice.
+ * methods: also 500/502/503/504. Others (dataset push, KV PUT, named storage
+ * create) only on a 503 that certainly was not processed: the rate limiter
+ * refused it ("rate-limit-unavailable", before the handler), another request
+ * held the storage name ("storage-name-busy", nothing changed), or HAProxy had
+ * no backend (its own page, nothing forwarded). Any other 503 may mean
+ * "outcome unknown" (e.g. a direct dataset write whose commit was not
+ * confirmed), and re-sending could store the items twice.
  */
 export function isRetryableResponse(status: number, idempotent: boolean, errorType?: string, bodyText?: string): boolean {
     if (status === 429) return true;
     if (idempotent) return status === 500 || status === 502 || status === 503 || status === 504;
     if (status !== 503) return false;
-    return errorType === 'rate-limit-unavailable' || (bodyText ?? '').includes(NO_BACKEND_MARKER);
+    return errorType === 'rate-limit-unavailable'
+        || errorType === 'storage-name-busy'
+        || (bodyText ?? '').includes(NO_BACKEND_MARKER);
 }
 
 /** Default time budget for retrying one API call (429, 503, network errors). */
@@ -510,7 +513,8 @@ async function postStorageCollection(
     // Not marked repeatable even by name: a 500 after the create (e.g. scoped
     // token registration failed) must surface, since a re-send would take the
     // existing-name path and hide it. POST rules apply (limiter/HAProxy 503,
-    // refused connection).
+    // "storage-name-busy" 503 while a parallel create holds the name, refused
+    // connection).
     return new CollectionApiClient(config).call<Record<string, unknown>>('POST', `${path}${query}`);
 }
 
