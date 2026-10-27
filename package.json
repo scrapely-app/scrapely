@@ -1,6 +1,6 @@
 {
     "name": "scrapely",
-    "version": "1.2.37",
+    "version": "1.2.38",
     "description": "Scrapely SDK for building JavaScript and TypeScript Actors",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
@@ -56,7 +56,7 @@
         "lodash": "^4.18.1",
         "mysql2": "^3.23.1",
         "playwright": "^1.58.2",
-        "scrapely-client": "^2.25.2",
+        "scrapely-client": "^2.25.9",
         "tar-fs": "2.1.5",
         "ws": "^8.18.0"
     },

@@ -174,7 +174,9 @@ function isApiStorageClientError(err: unknown): err is ApiStorageClientError {
 }
 
 // PUT is left out: a KV record PUT is counted (and billed) as a write each
-// time it is applied, so a lost response must not be re-sent blindly.
+// time it is applied, so a lost response must not be re-sent blindly. Record
+// PUTs carry an Idempotency-Key instead (see isKvRecordUrl), which the API
+// de-duplicates, so they are re-sent after a lost answer (e.g. an edge 502).
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'DELETE', 'OPTIONS']);
 // HAProxy's own 503 page: no backend was available, so nothing was forwarded.
 const NO_BACKEND_MARKER = 'No server is available to handle this request';
@@ -216,14 +218,33 @@ const keyedWritesDeduped = new Map<string, boolean>();
 /** Test override for every origin (undefined: learn from answers). */
 let keyedWritesDedupedOverride: boolean | undefined;
 
-function originOf(url: string): string {
-    try { return new URL(url).origin; } catch { return url; }
+/** A key-value store record URL (`.../key-value-stores/<id>/records/<key>`). */
+export function isKvRecordUrl(url: string): boolean {
+    let path = url;
+    try { path = new URL(url).pathname; } catch { /* a path already */ }
+    return path.includes('/key-value-stores/') && path.includes('/records/');
 }
 
-/** Whether the API at `url` (any URL of it; default: the last one seen) de-duplicates keyed writes. */
+/** What is learned per API: its origin, separately for record PUTs and other keyed writes. */
+function originOf(url: string): string {
+    let origin = url;
+    try { origin = new URL(url).origin; } catch { /* keep the input */ }
+    return isKvRecordUrl(url) ? `${origin}#kv-record` : origin;
+}
+
+/**
+ * Whether the API at `url` (any URL of it; default: the last one seen) de-duplicates keyed writes.
+ * Record PUTs count as de-duplicated until a keyed record PUT was stored without the support
+ * header: re-applying the same body to the same record leaves the same record, so the worst
+ * case on an API that ignores the key is one extra counted write, while not re-sending fails the run.
+ */
 export function apiDedupesKeyedWrites(url?: string): boolean {
     if (keyedWritesDedupedOverride !== undefined) return keyedWritesDedupedOverride;
-    if (url !== undefined) return keyedWritesDeduped.get(originOf(url)) === true;
+    if (url !== undefined) {
+        const learned = keyedWritesDeduped.get(originOf(url));
+        if (learned === undefined && isKvRecordUrl(url)) return true;
+        return learned === true;
+    }
     return [...keyedWritesDeduped.values()].pop() === true;
 }
 
@@ -925,10 +946,13 @@ export class ApiKeyValueStoreClient extends BaseApiClient implements KeyValueSto
         }
 
         // Pass timeout/retry options from KeyValueStoreRecordOptions to the API request
-        const requestOptions: ApiRequestOptions | undefined = options ? {
-            timeoutSecs: (options as any).timeoutSecs,
-            doNotRetryTimeouts: (options as any).doNotRetryTimeouts,
-        } : undefined;
+        // One Idempotency-Key for every attempt of this write: a re-send after a lost answer
+        // (edge 502/504, dropped connection) is applied and counted once.
+        const requestOptions: ApiRequestOptions = {
+            timeoutSecs: (options as any)?.timeoutSecs,
+            doNotRetryTimeouts: (options as any)?.doNotRetryTimeouts,
+            idempotencyKey: randomUUID(),
+        };
 
         await this.request('PUT', `/key-value-stores/${this.id}/records/${pathSegment(key)}`, body, contentType || ct, requestOptions);
     }
