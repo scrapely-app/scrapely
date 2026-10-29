@@ -64,6 +64,9 @@ export class ChargeRejectedError extends Error {
     readonly count: number;
     readonly statusCode?: number;
     readonly reason: string;
+    /** Which run limit refused the charge, when the platform said (see ChargeLimitReason). */
+    readonly limitReason?: ChargeLimitReason;
+    readonly maxItems?: number;
 
     constructor(
         message: string,
@@ -73,6 +76,8 @@ export class ChargeRejectedError extends Error {
             count: number;
             statusCode?: number;
             reason: string;
+            limitReason?: ChargeLimitReason;
+            maxItems?: number;
         },
     ) {
         super(message);
@@ -82,7 +87,108 @@ export class ChargeRejectedError extends Error {
         this.count = opts.count;
         this.statusCode = opts.statusCode;
         this.reason = opts.reason;
+        this.limitReason = opts.limitReason;
+        this.maxItems = opts.maxItems;
     }
+}
+
+/**
+ * Which run limit refused or cut down a charge: the platform's `error.reason`
+ * on HTTP 402 and `limitedBy` on a partial acceptance. 'max-items' is the item
+ * limit the user set (maxItems), 'max-charge' the maximum total charge
+ * (maxTotalChargeUsd), 'insufficient-funds' the account balance. The run's
+ * stop message names it, so an item limit is never called a spending limit.
+ */
+export type ChargeLimitReason = 'max-items' | 'max-charge' | 'insufficient-funds';
+
+const CHARGE_LIMIT_REASONS: ReadonlySet<string> = new Set(['max-items', 'max-charge', 'insufficient-funds']);
+
+function asChargeLimitReason(raw: unknown): ChargeLimitReason | undefined {
+    return typeof raw === 'string' && CHARGE_LIMIT_REASONS.has(raw) ? (raw as ChargeLimitReason) : undefined;
+}
+
+function positiveInt(raw: unknown): number | undefined {
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : undefined;
+}
+
+/** $3.00, $0.005: two decimals unless the amount needs more. */
+function formatUsd(usd: number): string {
+    return Math.abs(usd * 100 - Math.round(usd * 100)) < 1e-9 ? `$${usd.toFixed(2)}` : `$${Number(usd.toPrecision(6))}`;
+}
+
+/** The run's stop message for a charge limit, or undefined when the reason is unknown. */
+export function chargeLimitStopMessage(
+    reason: ChargeLimitReason | undefined,
+    opts: { maxItems?: number | null; maxTotalChargeUsd?: number | null } = {},
+): string | undefined {
+    if (reason === 'max-items') {
+        const n = opts.maxItems;
+        return n && n > 0
+            ? `Stopped: reached the item limit you set (${n} ${n === 1 ? 'item' : 'items'})`
+            : 'Stopped: reached the item limit you set';
+    }
+    if (reason === 'max-charge') {
+        const usd = opts.maxTotalChargeUsd;
+        return typeof usd === 'number' && Number.isFinite(usd)
+            ? `Stopped: reached the maximum charge you set (${formatUsd(usd)})`
+            : 'Stopped: reached the maximum charge you set';
+    }
+    if (reason === 'insufficient-funds') return 'Stopped: your account has no credit left for this run';
+    return undefined;
+}
+
+// A status-message clause that blames the spending limit ("stopped because the
+// maximum charge for this run was reached", "The run reached its maximum total
+// charge. Stopping.", ...). Actors written before the platform said which limit
+// was hit use such texts for every refused charge.
+const CHARGE_CLAIM_RE = /\bmax(?:imum)?\s+(?:total\s+)?charge|\bspending\s+limit/i;
+const CLAUSE_SEPARATOR_RE = /(;\s*|[.!?](?:\s+|$))/;
+
+/**
+ * Replace the clause of `message` that blames the spending limit with
+ * `stopMessage`: "Saved 800 results; stopped because the maximum charge for
+ * this run was reached" becomes "Saved 800 results. Stopped: reached the item
+ * limit you set (800 items)". Only the first such clause is replaced (later
+ * ones are dropped); a message without one is returned as is.
+ */
+export function rewriteChargeLimitClaims(message: string, stopMessage: string | undefined): string {
+    if (!message || !stopMessage || message.includes(stopMessage) || !CHARGE_CLAIM_RE.test(message)) return message;
+    const parts = message.split(CLAUSE_SEPARATOR_RE);
+    const out: string[] = [];
+    let replaced = false;
+    for (let i = 0; i < parts.length; i += 2) {
+        const clause = parts[i] ?? '';
+        const sep = parts[i + 1] ?? '';
+        if (!CHARGE_CLAIM_RE.test(clause)) {
+            out.push(clause + sep);
+            continue;
+        }
+        if (replaced) continue;
+        replaced = true;
+        const prev = out.length ? out[out.length - 1]!.trimEnd() : '';
+        if (prev.endsWith(';')) out[out.length - 1] = `${prev.slice(0, -1).trimEnd()}. `;
+        const lead = clause.slice(0, clause.length - clause.trimStart().length);
+        let tail = '';
+        if (sep) tail = [';', '.', '!', '?'].includes(sep.trim()) ? `.${sep.slice(sep.trimEnd().length)}` : sep;
+        out.push(lead + stopMessage + tail);
+    }
+    let result = out.join('').trimEnd();
+    if (message.trimEnd().endsWith('.') && !result.endsWith('.')) result += '.';
+    return result;
+}
+
+/** Which limit a 402 names: error.reason / error.data.reason, else its message (older platforms). */
+function rejectionLimit(err: unknown, message: string): { limitReason?: ChargeLimitReason; maxItems?: number } {
+    const e = err as { data?: Record<string, unknown>; reason?: unknown; body?: Record<string, unknown> } | undefined;
+    const data = e?.data && typeof e.data === 'object' ? e.data : undefined;
+    let limitReason = asChargeLimitReason(data?.reason) ?? asChargeLimitReason((e?.body?.error as Record<string, unknown> | undefined)?.reason);
+    const maxItems = positiveInt(data?.maxItems) ?? positiveInt(e?.body?.maxItems);
+    if (!limitReason) {
+        if (/maxitems|maximum number of results/i.test(message)) limitReason = 'max-items';
+        else if (/insufficient balance/i.test(message)) limitReason = 'insufficient-funds';
+        else if (/maximum total charge/i.test(message)) limitReason = 'max-charge';
+    }
+    return { limitReason, maxItems };
 }
 
 /** True when a ChargeRejectedError means the run's spending limit is used up. */
@@ -125,6 +231,11 @@ export function defaultDatasetIdFromEnv(): string | undefined {
  * clients for writes that did not go through `pushDataAndCharge`
  * (`Actor.openDataset().pushData()`, crawler `pushData`, ...).
  */
+/** `message` naming the limit that really stopped the run (Actor.setStatusMessage). */
+export function truthfulStatusMessage(message: string): string {
+    return activeChargingManager ? activeChargingManager.rewriteStatusMessage(message) : message;
+}
+
 export function refuseDefaultDatasetPush(itemCount: number): boolean {
     if (chargeGatedPush.getStore()) return false;
     return activeChargingManager?._refuseDefaultDatasetPush(itemCount) ?? false;
@@ -216,6 +327,12 @@ export class ChargingManager {
 
     /** Sticky: the platform refused or capped a charge (HTTP 402 / fewer accepted) or the local gate trimmed one. */
     private chargeLimitHit = false;
+    /** Which limit that was (the first one known wins) and the item limit the platform reported. */
+    private chargeLimitReason: ChargeLimitReason | undefined;
+    private chargeLimitMaxItems: number | undefined;
+    /** limitedBy / maxItems of the last partially accepted charge response. */
+    private lastLimitedBy: ChargeLimitReason | undefined;
+    private lastLimitMaxItems: number | undefined;
     /** Default-dataset rows refused after the limit (one warning, then a count). */
     private refusedDefaultDatasetItems = 0;
     /**
@@ -279,7 +396,7 @@ export class ChargingManager {
         this._closed = true;
         if (this.refusedDefaultDatasetItems > 0) {
             console.warn(
-                `[Scrapely] ${this.refusedDefaultDatasetItems} result(s) pushed to the default dataset after the spending limit was reached were not saved`,
+                `[Scrapely] ${this.refusedDefaultDatasetItems} result(s) pushed to the default dataset after ${this.limitName()} was reached were not saved`,
             );
         }
     }
@@ -306,17 +423,98 @@ export class ChargingManager {
         return this.calculateMaxChargesByPrice(Math.min(...prices)) <= 0;
     }
 
-    private markChargeLimitHit(): void {
-        if (this.isPayPerEvent) this.chargeLimitHit = true;
+    private markChargeLimitHit(reason?: ChargeLimitReason, maxItems?: number): void {
+        if (!this.isPayPerEvent) return;
+        this.chargeLimitHit = true;
+        if (reason && this.chargeLimitReason === undefined) this.chargeLimitReason = reason;
+        if (reason === 'max-items' && maxItems !== undefined && maxItems > 0) this.chargeLimitMaxItems = maxItems;
+    }
+
+    private markRejectedCharge(err: ChargeRejectedError): void {
+        if (isChargeLimitRejection(err)) this.markChargeLimitHit(err.limitReason, err.maxItems);
+    }
+
+    /** The platform accepted fewer events than asked: record which limit cut it. */
+    private markPartialCharge(): void {
+        this.markChargeLimitHit(this.lastLimitedBy, this.lastLimitMaxItems);
+    }
+
+    /** The run's item limit: as the platform reported it, else ACTOR_MAX_PAID_DATASET_ITEMS. */
+    private maxItemsSetting(): number | undefined {
+        if (this.chargeLimitMaxItems !== undefined) return this.chargeLimitMaxItems;
+        const raw = Number(process.env.ACTOR_MAX_PAID_DATASET_ITEMS ?? process.env.APIFY_ACTOR_MAX_PAID_DATASET_ITEMS);
+        return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : undefined;
+    }
+
+    /**
+     * Why this run's charges stopped being accepted, or undefined while they
+     * still are: 'max-items' (the item limit the user set), 'max-charge' (the
+     * maximum total charge) or 'insufficient-funds' (the account balance).
+     * Platforms that do not say which limit it was: inferred from the run's settings.
+     */
+    getChargeLimitReason(): ChargeLimitReason | undefined {
+        if (!this.isChargeLimitReached()) return undefined;
+        if (this.chargeLimitReason) return this.chargeLimitReason;
+        const maxItems = this.maxItemsSetting();
+        if (
+            maxItems !== undefined &&
+            Object.entries(this.chargingState ?? {}).some(
+                ([name, state]) => !isSyntheticEvent(name) && (this.pricingInfo[name]?.price ?? 0) > 0 && state.chargeCount >= maxItems,
+            )
+        ) {
+            return 'max-items';
+        }
+        if (Number.isFinite(this.maxTotalChargeUsd)) {
+            const prices = Object.values(this.pricingInfo).map(({ price }) => price).filter((price) => price > 0);
+            if (prices.length > 0 && this.calculateMaxChargesByPrice(Math.min(...prices)) <= 0) return 'max-charge';
+        }
+        return undefined;
+    }
+
+    /**
+     * The run's stop message for the limit that was reached, or undefined:
+     * "Stopped: reached the item limit you set (800 items)", "Stopped: reached
+     * the maximum charge you set ($3.00)", ... Use it as (part of) the final
+     * status message when the Actor stops because a charge was refused.
+     */
+    getChargeLimitMessage(): string | undefined {
+        return chargeLimitStopMessage(this.getChargeLimitReason(), {
+            maxItems: this.maxItemsSetting(),
+            maxTotalChargeUsd: Number.isFinite(this.maxTotalChargeUsd) ? this.maxTotalChargeUsd : null,
+        });
+    }
+
+    /** `message` with a clause blaming the spending limit replaced by the real reason (once a limit was reached). */
+    rewriteStatusMessage(message: string): string {
+        try {
+            return rewriteChargeLimitClaims(message, this.getChargeLimitMessage());
+        } catch {
+            return message;
+        }
+    }
+
+    /** 'the item limit of this run (maxItems = 800)', ... for log lines. */
+    private limitName(): string {
+        const reason = this.getChargeLimitReason();
+        if (reason === 'max-items') {
+            const n = this.maxItemsSetting();
+            return n ? `the item limit of this run (maxItems = ${n})` : 'the item limit of this run (maxItems)';
+        }
+        if (reason === 'insufficient-funds') return 'the end of the account balance';
+        if (reason === 'max-charge' || Number.isFinite(this.maxTotalChargeUsd)) {
+            const limit = Number.isFinite(this.maxTotalChargeUsd) ? `$${this.maxTotalChargeUsd}` : 'the limit';
+            return `the spending limit of this run (maxTotalChargeUsd = ${limit})`;
+        }
+        return 'the limit of this run';
     }
 
     /** @internal Count rows dropped because of the limit; warn on the first one only. */
     _noteRefusedDefaultDatasetItems(count: number): void {
         if (count <= 0) return;
         if (this.refusedDefaultDatasetItems === 0) {
-            const limit = Number.isFinite(this.maxTotalChargeUsd) ? `$${this.maxTotalChargeUsd}` : 'the limit';
+            const name = this.limitName();
             console.warn(
-                `[Scrapely] The spending limit of this run (maxTotalChargeUsd = ${limit}) has been reached: ` +
+                `[Scrapely] ${name[0]!.toUpperCase()}${name.slice(1)} has been reached: ` +
                     'results pushed to the default dataset are no longer saved. The Actor should stop now ' +
                     '(check ChargeResult.eventChargeLimitReached or Actor.getChargingManager().isChargeLimitReached()).',
             );
@@ -324,9 +522,9 @@ export class ChargingManager {
         this.refusedDefaultDatasetItems += count;
     }
 
-    /** @internal */
-    _markChargeLimitHit(): void {
-        this.markChargeLimitHit();
+    /** @internal `reason`: the limit that trimmed the push, when known. */
+    _markChargeLimitHit(reason?: ChargeLimitReason): void {
+        this.markChargeLimitHit(reason);
     }
 
     /** @internal Whether every row of a push with these events is charged a positive price. */
@@ -894,6 +1092,8 @@ export class ChargingManager {
                 const accepted = readAcceptedCount(body, intent.count);
                 const remaining = body.remainingBudgetNd;
                 this.lastRemainingBudgetNd = typeof remaining === 'number' && Number.isFinite(remaining) && remaining >= 0 ? remaining : null;
+                this.lastLimitedBy = asChargeLimitReason(body.limitedBy);
+                this.lastLimitMaxItems = positiveInt(body.maxItems);
                 return accepted;
             } catch (err) {
                 lastError = err;
@@ -1142,7 +1342,7 @@ export class ChargingManager {
                     try {
                         const accepted = await this.postChargeWithRetries(intent, deadline);
                         if (accepted !== null) {
-                            if (accepted < intent.count) this.markChargeLimitHit();
+                            if (accepted < intent.count) this.markPartialCharge();
                             const eventPrice = this.getEventPricing(intent.eventName).price;
                             this.applyAcceptedCount(
                                 intent.eventName,
@@ -1155,7 +1355,7 @@ export class ChargingManager {
                         }
                     } catch (err) {
                         if (err instanceof ChargeRejectedError) {
-                            if (isChargeLimitRejection(err)) this.markChargeLimitHit();
+                            this.markRejectedCharge(err);
                             const eventPrice = this.getEventPricing(intent.eventName).price;
                             this.applyAcceptedCount(intent.eventName, intent.count, 0, eventPrice);
                             this.pendingCharges.delete(intent.idempotencyKey);
@@ -1242,7 +1442,8 @@ export class ChargingManager {
             return 0;
         })();
 
-        if (chargedCount < count) this.markChargeLimitHit();
+        // The local budget gate: only maxTotalChargeUsd trims here.
+        if (chargedCount < count) this.markChargeLimitHit('max-charge');
 
         if (chargedCount === 0) {
             return {
@@ -1293,7 +1494,7 @@ export class ChargingManager {
                 accepted = await this.postChargeWithRetries(intent);
             } catch (err) {
                 if (err instanceof ChargeRejectedError) {
-                    if (isChargeLimitRejection(err)) this.markChargeLimitHit();
+                    this.markRejectedCharge(err);
                     // Server definitively rejected: unwind local reservation.
                     this.pendingCharges.delete(intent.idempotencyKey);
                     chargedCount = this.applyAcceptedCount(
@@ -1314,7 +1515,7 @@ export class ChargingManager {
                 this.pendingCharges.delete(intent.idempotencyKey);
                 if (accepted > 0) this.lastAcceptedOperationId = intent.idempotencyKey;
                 // The platform capped the charge at the run's limit.
-                if (accepted < chargedCount) this.markChargeLimitHit();
+                if (accepted < chargedCount) this.markPartialCharge();
                 chargedCount = this.applyAcceptedCount(
                     normalizedEventName,
                     chargedCount,
@@ -1356,7 +1557,7 @@ export class ChargingManager {
         if (chargedCount < count) {
             const subject = count === 1 ? 'instance' : 'instances';
             console.log(
-                `[Scrapely] Charging ${count} ${subject} of '${normalizedEventName}' event would exceed maxTotalChargeUsd - only ${chargedCount} events were charged`,
+                `[Scrapely] Charging ${count} ${subject} of '${normalizedEventName}' event would exceed ${this.limitName()} - only ${chargedCount} events were charged`,
             );
         }
 
@@ -1424,6 +1625,7 @@ function classifyChargeHttpError(
                 count: intent.count,
                 statusCode: status,
                 reason: status === 402 ? 'charge-limit-exceeded' : `http-${status}`,
+                ...(status === 402 ? rejectionLimit(err, String((err as Error)?.message ?? '')) : {}),
             },
         );
     }
@@ -1443,6 +1645,7 @@ function classifyChargeHttpError(
             count: intent.count,
             statusCode: status,
             reason: 'message-match',
+            ...(/charge-limit-exceeded/i.test(message) ? rejectionLimit(err, message) : {}),
         });
     }
     return null;
@@ -1557,7 +1760,7 @@ export async function pushDataAndCharge<T>({
         const allItemsTrimmed = itemsArray.length > 0 && limitedItems.length === 0;
         if (isDefaultDataset && limitedItems.length < itemsArray.length) {
             // Rows beyond what the budget can pay for are dropped.
-            chargingManager._markChargeLimitHit?.();
+            chargingManager._markChargeLimitHit?.('max-charge');
             chargingManager._noteRefusedDefaultDatasetItems?.(itemsArray.length - limitedItems.length);
         }
 

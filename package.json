@@ -1,6 +1,6 @@
 {
     "name": "scrapely",
-    "version": "1.2.38",
+    "version": "1.2.39",
     "description": "Scrapely SDK for building JavaScript and TypeScript Actors",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
@@ -94,6 +94,7 @@
         "@inquirer/external-editor": "3.0.3",
         "nanoid": "5.1.16",
         "browserslist": "4.28.7",
-        "basic-ftp": "^6.2.3"
+        "basic-ftp": "^6.2.3",
+        "@asamuzakjp/css-color": "^7.0.1"
     }
 }

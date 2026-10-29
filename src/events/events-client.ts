@@ -50,8 +50,9 @@ export function connectEvents(eventsWsUrl: string, token: string, runId: string)
     shouldReconnect = true;
 
     try {
-        const url = `${eventsWsUrl}?token=${encodeURIComponent(token)}&runId=${encodeURIComponent(runId)}`;
-        ws = new WebSocket(url);
+        // The token goes in a header, not the URL: URLs end up in access logs.
+        const url = `${eventsWsUrl}?runId=${encodeURIComponent(runId)}`;
+        ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
 
         ws.onopen = () => {
             connected = true;

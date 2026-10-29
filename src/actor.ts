@@ -37,7 +37,7 @@ import {
     type ChargeOptions as ChargingChargeOptions,
     type ChargeResult as ChargingChargeResult,
 } from './charging.js';
-import { pushDataWithCharges } from './charging.js';
+import { pushDataWithCharges, truthfulStatusMessage } from './charging.js';
 
 /** Options for a multi-event charged push (`Actor.pushData(row, { charges })`). */
 export interface PushDataChargeOptions {
@@ -1698,6 +1698,9 @@ export class Actor {
     static async setStatusMessage(message: string, options?: SetStatusMessageOptions): Promise<ActorRun> {
         const { isStatusMessageTerminal, level } = options || {};
         Actor._ensureActorInit('setStatusMessage');
+        // Actors word a refused charge as "the maximum charge for this run was
+        // reached" whatever refused it; name the limit that really stopped the run.
+        message = truthfulStatusMessage(message);
 
         const loggedStatusMessage = `[Status message]: ${message}`;
         switch (level) {

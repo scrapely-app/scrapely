@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.39] - 2026-10-29
+
+- A refused charge names the limit that refused it. When a charge is refused or cut short, the platform now says why (HTTP 402 `error.data.reason`, and `limitedBy` on a partial acceptance): the run's item limit (`maxItems`), its maximum total charge (`maxTotalChargeUsd`) or the account balance. The SDK used to call all of them the spending limit. Now its log lines name the real limit; `ChargingManager.getChargeLimitReason()` returns `'max-items'`, `'max-charge'` or `'insufficient-funds'` and `getChargeLimitMessage()` the stop message ("Stopped: reached the item limit you set (800 items)", "Stopped: reached the maximum charge you set ($3.00)", "Stopped: your account has no credit left for this run"); and once a limit was reached, a status message (`Actor.setStatusMessage`, `Actor.exit`, `Actor.fail`) whose clause blames the maximum charge gets that clause replaced by the real stop message. Platforms that do not send the reason yet: inferred from the 402 message and `ACTOR_MAX_PAID_DATASET_ITEMS`. What is charged and saved does not change.
+
 ## [1.2.38] - 2026-10-27
 
 - A key-value store record write (`Actor.setValue`, `KeyValueStore.setValue`) is no longer lost to one failed answer. Each write now sends an `Idempotency-Key`, and when its answer is lost (a `502`/`504` page from the edge or load balancer, a dropped connection, a timeout) it is sent again with the same key; the API applies and counts it once. Before, the write was never re-sent, so one such page on the final `OUTPUT` write failed the whole run. An API that answers a keyed write without `X-Scrapely-Idempotency` (an older server) gets no re-sends, as before.
