@@ -12,6 +12,7 @@ const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_HASH = 'sha256';
 const SALT_LENGTH = 32;
 const KEY_LENGTH = 32;
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 // ─── Private Key Decryption ───────────────────────────────────────────────────
 
@@ -117,6 +118,8 @@ export function mergeDecryptedInput(
   const merged = { ...input };
 
   for (const [fieldName, value] of Object.entries(decryptedSecrets)) {
+    // Never walk into or write onto an object's prototype chain.
+    if (fieldName.split('.').some((part) => UNSAFE_KEYS.has(part))) continue;
     if (fieldName.includes('.')) {
       // Handle nested paths
       const parts = fieldName.split('.');

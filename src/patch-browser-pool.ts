@@ -907,7 +907,33 @@ function patchRawPuppeteerModule(mod: any, moduleName: string): void {
                 // read-only export binding — the default export is still patched
             }
         }
+        // ESM-only puppeteer (v25+) loaded through require(): the named
+        // `launch` is a read-only binding to the original method, which hands
+        // off to a BrowserLauncher. Patch that class so it redirects too.
+        if (mod.launch === origBoundLaunch) patchPuppeteerBrowserLauncherClass(mod.BrowserLauncher, moduleName);
     }
+}
+
+/**
+ * Patch puppeteer's BrowserLauncher class (base of ChromeLauncher and
+ * FirefoxLauncher), which every PuppeteerNode launch goes through. Calls that
+ * already went through a patched launch decide the same way again (no CDP URL
+ * → local launch). Idempotent per class.
+ */
+function patchPuppeteerBrowserLauncherClass(BrowserLauncher: any, moduleName: string): void {
+    const proto = BrowserLauncher?.prototype;
+    if (!proto || typeof proto.launch !== 'function') return;
+    if (Object.prototype.hasOwnProperty.call(proto, '_scrapelyRawCdpPatched')) return;
+    const origLaunch = proto.launch;
+    proto.launch = function browserLauncherLaunchPatched(this: any, launchOptions?: RawLaunchOptionsLike) {
+        return puppeteerLaunchPatched(
+            this.puppeteer,
+            (options) => origLaunch.call(this, options),
+            moduleName,
+            launchOptions,
+        );
+    };
+    proto._scrapelyRawCdpPatched = true;
 }
 
 /**
@@ -926,9 +952,12 @@ const BROWSER_POOL_FILENAME_RE =
 /** playwright / playwright-core package entry, by filename (ESM imports and require.cache). */
 const PLAYWRIGHT_ENTRY_FILENAME_RE = /[/\\]node_modules[/\\](playwright|playwright-core)[/\\]index\.js$/;
 
-/** puppeteer / puppeteer-core CJS package entry (default instance), by filename. */
+/**
+ * puppeteer / puppeteer-core package entry (default instance), by filename:
+ * `lib/cjs/puppeteer/…` up to v24, `lib/puppeteer/…` in the ESM-only v25+.
+ */
 const PUPPETEER_ENTRY_FILENAME_RE =
-    /[/\\]node_modules[/\\](puppeteer|puppeteer-core)[/\\]lib[/\\]cjs[/\\]puppeteer[/\\](puppeteer|puppeteer-core)\.js$/;
+    /[/\\]node_modules[/\\](puppeteer|puppeteer-core)[/\\]lib[/\\](?:cjs[/\\])?puppeteer[/\\](puppeteer|puppeteer-core)\.js$/;
 
 /** puppeteer-core's PuppeteerNode class file (CJS), as requested by node/node.js or cached. */
 const PUPPETEER_NODE_REQUEST_RE = /(^|[/\\])PuppeteerNode(\.js)?$/;
