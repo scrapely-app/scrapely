@@ -1044,6 +1044,20 @@ export class Actor {
         const { Dataset } = await import('@crawlee/core');
         const dataset = await Dataset.open();
 
+        const isDefault = dataset.id === this.config.get('defaultDatasetId');
+        // A priced default-dataset item event: rows are trimmed to the budget and
+        // counted like a charged push, so the spending limit is seen locally.
+        if (
+            eventName === undefined
+            && !this.usesPushDataInterception(dataset)
+            && this.initialized
+            && isDefault
+            && this.chargingManager._isPayPerEvent()
+            && this.chargingManager._isPaidPerItem(undefined, true)
+        ) {
+            return this.pushDataWithExplicitCharging(dataset, item, undefined);
+        }
+
         if (eventName === undefined && !this.usesPushDataInterception(dataset)) {
             // Charge-limit safety net (also for local storage): this push is not
             // charged, so past the run's spending limit it is not stored.

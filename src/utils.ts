@@ -21,7 +21,12 @@ export interface EnqueueLinksOptions {
     userData?: Record<string, any>;
     /** Optional transformation function for each URL */
     transformRequestFunction?: (request: { url: string; userData?: Record<string, any> }) => { url: string; userData?: Record<string, any> } | null;
+    /** Most requests to enqueue from this page. Default: no limit */
+    limit?: number;
 }
+
+/** Requests sent to the queue per addRequests call. */
+const ENQUEUE_BATCH_SIZE = 100;
 
 /**
  * Enqueues links found on the page using a CSS selector.
@@ -47,7 +52,8 @@ export async function enqueueLinks(options: EnqueueLinksOptions): Promise<void> 
         selector = 'a[href]', 
         baseUrl,
         userData = {},
-        transformRequestFunction 
+        transformRequestFunction,
+        limit = Infinity,
     } = options;
 
     // Collect all matching URLs
@@ -70,8 +76,10 @@ export async function enqueueLinks(options: EnqueueLinksOptions): Promise<void> 
     // Deduplicate URLs
     const uniqueUrls = [...new Set(urls)];
 
-    // Add each URL to the request queue
+    // Build the requests (up to `limit`), then add them to the queue in batches
+    const requests: { url: string; userData?: Record<string, any> }[] = [];
     for (const url of uniqueUrls) {
+        if (requests.length >= limit) break;
         const request: { url: string; userData: Record<string, any> } = {
             url,
             userData: { ...userData },
@@ -82,9 +90,11 @@ export async function enqueueLinks(options: EnqueueLinksOptions): Promise<void> 
             ? transformRequestFunction(request)
             : request;
 
-        if (transformed) {
-            await requestQueue.addRequest(transformed);
-        }
+        if (transformed) requests.push(transformed);
+    }
+
+    for (let i = 0; i < requests.length; i += ENQUEUE_BATCH_SIZE) {
+        await requestQueue.addRequests(requests.slice(i, i + ENQUEUE_BATCH_SIZE));
     }
 }
 

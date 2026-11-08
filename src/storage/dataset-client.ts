@@ -15,9 +15,10 @@ interface ExtendedDatasetListOptions extends DatasetClientListOptions {
     skipEmpty?: boolean;
 }
 import type { DragonflyClient } from './dragonfly-client.js';
-import { nowISO } from './utils.js';
+import { nowISO, ownerNameField, releaseOwnerName } from './utils.js';
 import { BillingTracker } from './billing-tracker.js';
 import { pushItemsAtomic } from './dataset-push-script.js';
+import { queueInheritExpiry } from './ttl-manager.js';
 
 function makeAsyncIterableResult<T>(promiseFn: () => Promise<PaginatedList<T>>): AsyncIterable<T> & Promise<PaginatedList<T>> {
     const promise = promiseFn();
@@ -73,10 +74,12 @@ export class DragonflyDatasetClient<Data extends Dictionary = Dictionary> implem
             const raw = await this.client.redis.hget(indexKey, `id:${this.id}`);
             if (raw) {
                 const data = JSON.parse(raw);
-                if (data.name) await this.client.redis.hdel(indexKey, `name:${data.name}`);
+                // Name pointers are scoped by owner (name:{userId}:{name}).
+                const ownerId: string | undefined = data.userId ?? this.client.billingContext?.userId;
+                await releaseOwnerName(this.client.redis, indexKey, ownerId, data.name, this.id);
                 data.name = newFields.name;
                 await this.client.redis.hset(indexKey, `id:${this.id}`, JSON.stringify(data));
-                await this.client.redis.hset(indexKey, `name:${newFields.name}`, JSON.stringify(data));
+                if (ownerId && newFields.name) await this.client.redis.hset(indexKey, ownerNameField(ownerId, newFields.name), JSON.stringify(data));
             }
         }
         await this.client.redis.hset(this.infoKey, 'modifiedAt', now.toISOString());
@@ -89,7 +92,7 @@ export class DragonflyDatasetClient<Data extends Dictionary = Dictionary> implem
 
         const indexKey = this.client.key('datasets:index');
         await this.client.redis.hdel(indexKey, `id:${this.id}`);
-        if (info?.name) await this.client.redis.hdel(indexKey, `name:${info.name}`);
+        await releaseOwnerName(this.client.redis, indexKey, info?.userId || this.client.billingContext?.userId, info?.name, this.id);
     }
 
     async downloadItems(): Promise<Buffer> {
@@ -244,6 +247,10 @@ export class DragonflyDatasetClient<Data extends Dictionary = Dictionary> implem
         // separate round trips allowed concurrent pushes to allocate the same
         // slot indices, silently overwriting items.
         await pushItemsAtomic(this.client.redis, this.infoKey, this.itemsKey, serializedItems, totalBytes);
+        // The items hash is created by the first push: give it the dataset's expiry.
+        const expiry = this.client.redis.pipeline();
+        queueInheritExpiry(expiry, this.infoKey, [this.itemsKey]);
+        await expiry.exec();
 
         // Track billing using client's billing context
         if (this.client.billingContext) {

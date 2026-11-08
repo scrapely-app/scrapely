@@ -6,8 +6,9 @@ import type {
 } from '@crawlee/types';
 import { Readable } from 'node:stream';
 import type { DragonflyClient } from './dragonfly-client.js';
-import { nowISO, pathSegment } from './utils.js';
+import { nowISO, ownerNameField, pathSegment, releaseOwnerName } from './utils.js';
 import { BillingTracker } from './billing-tracker.js';
+import { queueInheritExpiry } from './ttl-manager.js';
 import { Configuration } from '../configuration.js';
 import {
     filterKeysByCollection,
@@ -90,10 +91,12 @@ export class DragonflyKeyValueStoreClient implements KeyValueStoreClient {
             const raw = await this.client.redis.hget(indexKey, `id:${this.id}`);
             if (raw) {
                 const data = JSON.parse(raw);
-                if (data.name) await this.client.redis.hdel(indexKey, `name:${data.name}`);
+                // Name pointers are scoped by owner (name:{userId}:{name}).
+                const ownerId: string | undefined = data.userId ?? this.client.billingContext?.userId;
+                await releaseOwnerName(this.client.redis, indexKey, ownerId, data.name, this.id);
                 data.name = newFields.name;
                 await this.client.redis.hset(indexKey, `id:${this.id}`, JSON.stringify(data));
-                await this.client.redis.hset(indexKey, `name:${newFields.name}`, JSON.stringify(data));
+                if (ownerId && newFields.name) await this.client.redis.hset(indexKey, ownerNameField(ownerId, newFields.name), JSON.stringify(data));
             }
         }
         await this.client.redis.hset(this.infoKey, 'modifiedAt', nowISO().toISOString());
@@ -105,7 +108,7 @@ export class DragonflyKeyValueStoreClient implements KeyValueStoreClient {
         await this.client.redis.del(this.infoKey, this.recordsKey, this.metaKey);
         const indexKey = this.client.key('kvs:index');
         await this.client.redis.hdel(indexKey, `id:${this.id}`);
-        if (info?.name) await this.client.redis.hdel(indexKey, `name:${info.name}`);
+        await releaseOwnerName(this.client.redis, indexKey, info?.userId || this.client.billingContext?.userId, info?.name, this.id);
     }
 
     async recordExists(key: string): Promise<boolean> {
@@ -194,6 +197,8 @@ export class DragonflyKeyValueStoreClient implements KeyValueStoreClient {
         }
 
         pipeline.hset(this.infoKey, 'modifiedAt', nowISO().toISOString());
+        // Records/meta are created by the first write: give them the store's expiry.
+        queueInheritExpiry(pipeline, this.infoKey, [this.recordsKey, this.metaKey]);
         await pipeline.exec();
 
         // Track billing using client's billing context

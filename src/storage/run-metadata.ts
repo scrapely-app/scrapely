@@ -266,6 +266,15 @@ export class RunMetadataManager {
         }
         const ttlResults = await ttlPipeline.exec();
 
+        // Runs whose hash is gone (TTL = -2: expired or deleted outside delete()) leave the
+        // sorted set here, so it doesn't keep one entry per run ever created.
+        const staleIds = olderIds.filter(
+            (_, i) => (ttlResults?.[i]?.[1] as number) === -2,
+        );
+        if (staleIds.length > 0) {
+            await this.client.redis.zrem(userRunsKey, ...staleIds);
+        }
+
         // Collect only the runs that were demoted (exist but have no expiry, TTL = -1)
         const demotedIds = olderIds.filter(
             (_, i) => (ttlResults?.[i]?.[1] as number) === -1,

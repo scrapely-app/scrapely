@@ -1,4 +1,25 @@
 import type Redis from 'ioredis';
+import type { ChainableCommander } from 'ioredis';
+
+/**
+ * KEYS[1]: a storage's info key; KEYS[2..]: its data keys. Gives each data key the info key's
+ * remaining expiry (NX: one that has an expiry keeps it). An expiry set at creation is a no-op
+ * on data keys that don't exist yet, so a key created lazily on the first write never expired.
+ */
+const INHERIT_EXPIRY_LUA = `
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl <= 0 then return 0 end
+for i = 2, #KEYS do
+  redis.call('PEXPIRE', KEYS[i], ttl, 'NX')
+end
+return 1
+`;
+
+/** Queue INHERIT_EXPIRY_LUA: the lazily created `keys` expire with `infoKey` (nothing when it has no expiry). */
+export function queueInheritExpiry(pipeline: ChainableCommander, infoKey: string, keys: string[]): void {
+    if (keys.length === 0) return;
+    pipeline.eval(INHERIT_EXPIRY_LUA, keys.length + 1, infoKey, ...keys);
+}
 
 /**
  * TTL configuration in seconds

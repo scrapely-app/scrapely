@@ -1,24 +1,22 @@
 import type { KeyValueStoreCollectionClient, KeyValueStoreInfo, PaginatedList } from '@crawlee/types';
 import type { DragonflyClient } from './dragonfly-client.js';
-import { generateId, nowISO } from './utils.js';
+import { generateId, nowISO, ownerNameField, releaseOwnerName, requireStorageOwner } from './utils.js';
 
 export class DragonflyKeyValueStoreCollectionClient implements KeyValueStoreCollectionClient {
     constructor(private client: DragonflyClient) {}
 
     async getOrCreate(name?: string): Promise<KeyValueStoreInfo> {
         const indexKey = this.client.key('kvs:index');
+        // Every storage belongs to the run's user; the name pointer is scoped by that user.
+        const userId = requireStorageOwner(this.client.billingContext, 'key-value store');
 
         if (name) {
-            const existing = await this.client.redis.hget(indexKey, `name:${name}`);
+            const existing = await this.client.redis.hget(indexKey, ownerNameField(userId, name));
             if (existing) return JSON.parse(existing);
         }
 
         const id = generateId();
         const now = nowISO();
-        // Derive ownership from the active billing context (as the request-queue
-        // client does); the server authorizes against this persisted field.
-        // The legacy '1' placeholder applies only when no context is present.
-        const userId = this.client.billingContext?.userId ?? '1';
         const data: KeyValueStoreInfo = {
             id,
             name,
@@ -29,7 +27,7 @@ export class DragonflyKeyValueStoreCollectionClient implements KeyValueStoreColl
         };
 
         await this.client.redis.hset(indexKey, `id:${id}`, JSON.stringify(data));
-        if (name) await this.client.redis.hset(indexKey, `name:${name}`, JSON.stringify(data));
+        if (name) await this.client.redis.hset(indexKey, ownerNameField(userId, name), JSON.stringify(data));
 
         const infoKey = this.client.key('kvs', id, 'info');
         const recordsKey = this.client.key('kvs', id, 'records');
@@ -73,7 +71,7 @@ export class DragonflyKeyValueStoreCollectionClient implements KeyValueStoreColl
             const exists = await this.client.redis.exists(infoKey);
             if (!exists) {
                 await this.client.redis.hdel(indexKey, `id:${parsed.id}`);
-                if (parsed.name) await this.client.redis.hdel(indexKey, `name:${parsed.name}`);
+                await releaseOwnerName(this.client.redis, indexKey, parsed.userId, parsed.name, parsed.id);
                 continue;
             }
 

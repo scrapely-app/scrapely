@@ -1,15 +1,17 @@
 import type { DatasetCollectionClient, DatasetCollectionData, PaginatedList, Dataset } from '@crawlee/types';
 import type { DragonflyClient } from './dragonfly-client.js';
-import { generateId, nowISO } from './utils.js';
+import { generateId, nowISO, ownerNameField, releaseOwnerName, requireStorageOwner } from './utils.js';
 
 export class DragonflyDatasetCollectionClient implements DatasetCollectionClient {
     constructor(private client: DragonflyClient) {}
 
     async getOrCreate(name?: string): Promise<DatasetCollectionData> {
         const indexKey = this.client.key('datasets:index');
+        // Every storage belongs to the run's user; the name pointer is scoped by that user.
+        const userId = requireStorageOwner(this.client.billingContext, 'dataset');
 
         if (name) {
-            const existing = await this.client.redis.hget(indexKey, `name:${name}`);
+            const existing = await this.client.redis.hget(indexKey, ownerNameField(userId, name));
             if (existing) return JSON.parse(existing);
         }
 
@@ -24,7 +26,7 @@ export class DragonflyDatasetCollectionClient implements DatasetCollectionClient
         };
 
         await this.client.redis.hset(indexKey, `id:${id}`, JSON.stringify(data));
-        if (name) await this.client.redis.hset(indexKey, `name:${name}`, JSON.stringify(data));
+        if (name) await this.client.redis.hset(indexKey, ownerNameField(userId, name), JSON.stringify(data));
 
         const infoKey = this.client.key('dataset', id, 'info');
         const itemsKey = this.client.key('dataset', id, 'items');
@@ -67,7 +69,7 @@ export class DragonflyDatasetCollectionClient implements DatasetCollectionClient
             const exists = await this.client.redis.exists(infoKey);
             if (!exists) {
                 await this.client.redis.hdel(indexKey, `id:${parsed.id}`);
-                if (parsed.name) await this.client.redis.hdel(indexKey, `name:${parsed.name}`);
+                await releaseOwnerName(this.client.redis, indexKey, parsed.userId ?? this.client.billingContext?.userId, parsed.name, parsed.id);
                 continue;
             }
 

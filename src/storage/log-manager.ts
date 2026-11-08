@@ -1,5 +1,5 @@
 import type { DragonflyClient } from './dragonfly-client.js';
-import type { UserPlan } from './ttl-manager.js';
+import { queueInheritExpiry, type UserPlan } from './ttl-manager.js';
 import { RunMetadataManager, type RunStatus } from './run-metadata.js';
 
 /**
@@ -116,11 +116,15 @@ export class LogManager {
             const alignedOffset = LogManager.alignUtf8Boundary(trailingBuf, 0);
             const safeTrailing = trailingBuf.subarray(alignedOffset);
 
-            // Overwrite the key with only the safe trailing portion
-            await this.client.redis.set(key, safeTrailing);
+            // Overwrite the key with only the safe trailing portion (keeping the log's expiry)
+            await this.client.redis.set(key, safeTrailing, 'KEEPTTL');
 
-            // Mark log as truncated (NX — only set once; ignore if already set)
+            // Mark log as truncated (NX — only set once; ignore if already set). The marker
+            // is created here, after setLogTtl ran: it takes the log's expiry.
             await this.client.redis.set(this.getTruncatedKey(runId), '1', 'NX');
+            const expiry = this.client.redis.pipeline();
+            queueInheritExpiry(expiry, key, [this.getTruncatedKey(runId)]);
+            await expiry.exec();
         }
     }
 
@@ -149,7 +153,7 @@ export class LogManager {
         const key = this.getLogKey(runId);
         const ttl = this.client.ttlManager.getTtl('logs', plan);
         if (ttl !== null && ttl > 0) {
-            await this.client.ttlManager.setExpiry(this.client.redis, [key], ttl);
+            await this.client.ttlManager.setExpiry(this.client.redis, [key, this.getTruncatedKey(runId)], ttl);
         }
     }
 

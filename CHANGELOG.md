@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.41] - 2026-11-08
+
+- An atomic multi-event push (`Actor.pushData(rows, { charges })`) whose charge the limit covers only in part no longer logs "Charging 5 instances of 'audio-minute' event would exceed the end of the account balance - only 3 events were charged". A row is saved only when all of its events are charged, so the SDK gives those 3 back and nothing is charged: the line was untrue. It now says what happened: "Saving this item needs 5 'audio-minute' event(s), but the account balance covers only 3: it was not saved and nothing was charged for it." When some rows still fit, it names how many were saved and charged in full, and when giving a charge back is not confirmed it says so instead of "nothing was charged". A plain `Actor.charge()` that comes back short keeps its line: those events do stay charged.
+- `ChargeResult.coveredCounts` (from `pushData(rows, { charges })`): for each event whose charge came back short, how many events the limit covered (given back, not charged), e.g. `{ 'audio-minute': 3 }`. Actors can cut a row to what the limit covers without reading the log. What is charged and saved does not change.
+- A spending limit of $0 (`maxTotalChargeUsd: 0`) is a real limit, the same as on the platform. It used to be read as "no limit". A missing or non-numeric value still means no limit.
+- A plain `Actor.pushData(items)` to the default dataset of a pay-per-event Actor whose dataset item event is priced goes through the charged push: rows past the spending limit are not saved, and it returns a `ChargeResult`. Before, all rows were saved and only the ones within the limit were paid.
+- A dataset push that fails with a `503 push-outcome-unknown` (the server could not tell whether it was stored) keeps its charge instead of voiding it.
+- `utils.enqueueLinks({ limit })`: enqueue at most `limit` links per page; links are added to the queue in batches of 100.
+- Dragonfly storage clients: named datasets, key-value stores and request queues are looked up per owner (`name:{userId}:{name}`, as the server stores them), a storage is created only with a known owner, and keys created later (dataset items, records, the log truncation marker) take their storage's expiry. Actor runs on the platform use the API storage client and are not affected.
+
 ## [1.2.40] - 2026-10-30
 
 - Actors on puppeteer 25 (ESM-only) are sent to the remote browser when puppeteer is loaded with `require()` before the SDK on a run without the preload. The SDK only recognised puppeteer's old `lib/cjs` build, so such a `puppeteer.launch()` tried to start a local browser; the named `launch` export (`const { launch } = require('puppeteer')`) is covered too. puppeteer 24 and older behave as before.

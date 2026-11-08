@@ -290,6 +290,53 @@ export interface ChargeResult {
     eventChargeLimitReached: boolean;
     chargedCount: number;
     chargeableWithinLimit: Record<string, number>;
+    /**
+     * `pushData(rows, { charges })` only: for each event whose charge came back
+     * short, how many events the limit (account balance, maxTotalChargeUsd,
+     * maxItems) covered. A row is saved only when all of its events are charged,
+     * so those events were given back, not charged. Empty when no charge came
+     * back short.
+     */
+    coveredCounts?: Record<string, number>;
+}
+
+/** @internal A charge of an atomic push that the limit accepted only in part (then given back). */
+export interface ShortCharge {
+    eventName: string;
+    requested: number;
+    covered: number;
+    limit: string;
+}
+
+function itemsPhrase(count: number): { what: string; were: string; them: string } {
+    return count === 1
+        ? { what: 'this item', were: 'it was', them: 'it' }
+        : { what: `these ${count} items`, were: 'they were', them: 'them' };
+}
+
+/** @internal Log what an atomic push whose charge came back short really did. */
+export function logAtomicRefusal(shorts: ShortCharge[], rowsPushed: number, rowsSaved: number, givenBack: boolean): void {
+    const first = shorts[0];
+    if (!first) return;
+    const limit = first.limit.replace(/^the end of /, '');
+    const { what, were, them } = itemsPhrase(rowsPushed);
+    const head = `[Scrapely] Saving ${what} needs ${first.requested} '${first.eventName}' event(s), but ${limit} covers only ${first.covered}`;
+    if (rowsSaved <= 0) {
+        console.log(
+            givenBack
+                ? `${head}: ${were} not saved and nothing was charged for ${them}.`
+                : `${head}: ${were} not saved, but the ${first.covered} event(s) charged for ${them} could not be given back yet (see the warning about it).`,
+        );
+        return;
+    }
+    const left = rowsPushed - rowsSaved;
+    const rest = itemsPhrase(left);
+    const tail = givenBack
+        ? `nothing was charged for ${rest.them}`
+        : `what was charged for ${rest.them} could not be given back yet (see the warning about it)`;
+    console.log(
+        `${head}: saved the first ${rowsSaved} item(s), charged in full; the other ${left} ${rest.were.split(' ').pop()} not saved and ${tail}.`,
+    );
 }
 
 export interface ActorPricingInfo {
@@ -318,6 +365,17 @@ export function mergeChargeResults(a: ChargeResult, b: ChargeResult): ChargeResu
 }
 
 /**
+ * The run's spending limit (maxTotalChargeUsd), or Infinity when uncapped.
+ * 0 is a real limit (no fees), the same as on the platform; only a missing
+ * or non-numeric value means uncapped.
+ */
+function spendingLimitUsd(value: unknown): number {
+    if (value == null || value === '') return Infinity;
+    const usd = Number(value);
+    return Number.isFinite(usd) && usd >= 0 ? usd : Infinity;
+}
+
+/**
  * Pay-per-event charging for platform runs.
  * Reports charges via POST /v2/actor-runs/:runId/charge (Redis → worker billing).
  */
@@ -335,6 +393,12 @@ export class ChargingManager {
     private lastLimitMaxItems: number | undefined;
     /** Default-dataset rows refused after the limit (one warning, then a count). */
     private refusedDefaultDatasetItems = 0;
+    /**
+     * @internal Set by pushDataWithCharges while it runs (it holds the operation
+     * lock): charges that come back short are collected here instead of being
+     * logged as "only N events were charged", because the atomic push gives them back.
+     */
+    _shortCharges: ShortCharge[] | undefined;
     /**
      * Prepaid-row balance: priced events charged through charge() minus rows
      * pushed to the default dataset without a per-row charge. An Actor that
@@ -665,7 +729,7 @@ export class ChargingManager {
         apifyClient: ApifyClient | (() => ApifyClient),
     ) {
         this.apifyClientSource = apifyClient;
-        this.maxTotalChargeUsd = configuration.get('maxTotalChargeUsd') || Infinity;
+        this.maxTotalChargeUsd = spendingLimitUsd(configuration.get('maxTotalChargeUsd'));
         this.isAtHome = !!configuration.get('isAtHome');
         this.actorRunId = configuration.get('actorRunId') || '';
     }
@@ -716,7 +780,7 @@ export class ChargingManager {
             return {
                 pricingInfo: actorPricingInfo ? (JSON.parse(actorPricingInfo) as ActorRunPricingInfo) : undefined,
                 chargedEventCounts: JSON.parse(chargedEventCounts) as Record<string, number>,
-                maxTotalChargeUsd: this.configuration.get('maxTotalChargeUsd') || Infinity,
+                maxTotalChargeUsd: spendingLimitUsd(this.configuration.get('maxTotalChargeUsd')),
             };
         }
 
@@ -733,14 +797,14 @@ export class ChargingManager {
             return {
                 pricingInfo: run.pricingInfo,
                 chargedEventCounts: run.chargedEventCounts,
-                maxTotalChargeUsd: run.options?.maxTotalChargeUsd || Infinity,
+                maxTotalChargeUsd: spendingLimitUsd(run.options?.maxTotalChargeUsd),
             };
         }
 
         return {
             pricingInfo: undefined,
             chargedEventCounts: {},
-            maxTotalChargeUsd: this.configuration.get('maxTotalChargeUsd') || Infinity,
+            maxTotalChargeUsd: spendingLimitUsd(this.configuration.get('maxTotalChargeUsd')),
         };
     }
 
@@ -1555,10 +1619,17 @@ export class ChargingManager {
         }
 
         if (chargedCount < count) {
-            const subject = count === 1 ? 'instance' : 'instances';
-            console.log(
-                `[Scrapely] Charging ${count} ${subject} of '${normalizedEventName}' event would exceed ${this.limitName()} - only ${chargedCount} events were charged`,
-            );
+            if (this._shortCharges) {
+                // Inside an atomic push: this charge is given back unless the row is
+                // saved, so "only N events were charged" would not be true there.
+                // pushDataWithCharges logs what really happened instead.
+                this._shortCharges.push({ eventName: normalizedEventName, requested: count, covered: chargedCount, limit: this.limitName() });
+            } else {
+                const subject = count === 1 ? 'instance' : 'instances';
+                console.log(
+                    `[Scrapely] Charging ${count} ${subject} of '${normalizedEventName}' event would exceed ${this.limitName()} - only ${chargedCount} events were charged`,
+                );
+            }
         }
 
         return {
@@ -2101,63 +2172,80 @@ export async function pushDataWithCharges<T>({
 
         // credit: paid by an earlier charge whose results were not stored (void refused).
         type Op = { name: string; charged: number; operationId?: string; uncertain: boolean; credit?: boolean };
+        // Charges of this push that came back short: given back, and logged once the
+        // outcome is known (logAtomicRefusal), not as "only N events were charged".
+        const shorts: ShortCharge[] = [];
+        let givenBack = true;
         const undo = async (ops: Op[]) => {
             for (const op of ops) {
                 if (op.charged <= 0) continue;
                 if (op.credit) returnVoidCredit(chargingManager, op.name, op.charged);
                 else if (!op.operationId) chargingManager.applyAcceptedCount(op.name, op.charged, 0);
                 // Cancel / void; a refused void stays billed and becomes credit.
-                else await voidOrCredit(chargingManager, op.name, op.operationId, op.charged, op.uncertain);
+                else if ((await voidOrCredit(chargingManager, op.name, op.operationId, op.charged, op.uncertain)) !== 'voided') givenBack = false;
             }
         };
+        // Per event: how many events the limit covered in its last short answer.
+        const coveredCounts = () => Object.fromEntries(shorts.map((sc) => [sc.eventName, sc.covered]));
         const order = Object.entries(perRow).sort(([a], [b]) => Number(isSyntheticEvent(a)) - Number(isSyntheticEvent(b)) || a.localeCompare(b));
         let ops: Op[] = [];
-        for (let attempt = 0; attempt < 6 && rows > 0; attempt++) {
-            ops = [];
-            let shortTo: number | null = null;
-            for (const [name, n] of order) {
-                const want = n * rows;
-                chargingManager._takeLastAcceptedOperationId?.();
-                let got: number;
-                if (takeVoidCredit(chargingManager, name, want) > 0) {
-                    got = want;
-                    ops.push({ name, charged: want, uncertain: false, credit: true });
-                } else {
-                    try {
-                        const r = await chargingManager._chargeExclusive({ eventName: name, count: want });
-                        got = r.chargedCount;
-                        ops.push({ name, charged: got, operationId: chargingManager._takeLastAcceptedOperationId?.(), uncertain: false });
-                    } catch (err) {
-                        if (!(err instanceof ChargeUncertainError)) {
-                            await undo(ops);
-                            throw err;
+        chargingManager._shortCharges = shorts;
+        try {
+            for (let attempt = 0; attempt < 6 && rows > 0; attempt++) {
+                ops = [];
+                let shortTo: number | null = null;
+                for (const [name, n] of order) {
+                    const want = n * rows;
+                    chargingManager._takeLastAcceptedOperationId?.();
+                    let got: number;
+                    if (takeVoidCredit(chargingManager, name, want) > 0) {
+                        got = want;
+                        ops.push({ name, charged: want, uncertain: false, credit: true });
+                    } else {
+                        try {
+                            const r = await chargingManager._chargeExclusive({ eventName: name, count: want });
+                            got = r.chargedCount;
+                            ops.push({ name, charged: got, operationId: chargingManager._takeLastAcceptedOperationId?.(), uncertain: false });
+                        } catch (err) {
+                            if (!(err instanceof ChargeUncertainError)) {
+                                await undo(ops);
+                                throw err;
+                            }
+                            // Not confirmed: stays pending and is re-posted at exit, so it counts as accepted.
+                            got = err.count;
+                            ops.push({ name, charged: got, operationId: err.operationId, uncertain: true });
                         }
-                        // Not confirmed: stays pending and is re-posted at exit, so it counts as accepted.
-                        got = err.count;
-                        ops.push({ name, charged: got, operationId: err.operationId, uncertain: true });
+                    }
+                    if (got < want) {
+                        shortTo = Math.floor(got / n);
+                        break;
                     }
                 }
-                if (got < want) {
-                    shortTo = Math.floor(got / n);
-                    break;
-                }
+                if (shortTo === null) break;
+                // An event came back short: void this attempt and retry with the whole
+                // rows the budget covers at the FULL per-row cost (sizing from the short
+                // event alone came back short again: appstore 64df0a3608d74af88, 0 saved).
+                // At least one single-row try: the last affordable row may still fit.
+                const attemptOps = ops.map((op) => ({ name: op.name, charged: op.charged }));
+                await undo(ops);
+                ops = [];
+                rows = Math.min(rows - 1, Math.max(chargingManager._rowsAfterShort(attemptOps, perRow), 1));
             }
-            if (shortTo === null) break;
-            // An event came back short: void this attempt and retry with the whole
-            // rows the budget covers at the FULL per-row cost (sizing from the short
-            // event alone came back short again: appstore 64df0a3608d74af88, 0 saved).
-            // At least one single-row try: the last affordable row may still fit.
-            const attemptOps = ops.map((op) => ({ name: op.name, charged: op.charged }));
-            await undo(ops);
-            ops = [];
-            rows = Math.min(rows - 1, Math.max(chargingManager._rowsAfterShort(attemptOps, perRow), 1));
+        } finally {
+            chargingManager._shortCharges = undefined;
         }
 
         if (rows <= 0 || ops.length === 0) {
             await undo(ops);
+            logAtomicRefusal(shorts, rowsIn.length, 0, givenBack);
             chargingManager._markChargeLimitHit();
             if (isDefaultDataset) chargingManager._noteRefusedDefaultDatasetItems(rowsIn.length);
-            return { eventChargeLimitReached: true, chargedCount: 0, chargeableWithinLimit: chargingManager._chargeableWithinLimit() };
+            return {
+                eventChargeLimitReached: true,
+                chargedCount: 0,
+                chargeableWithinLimit: chargingManager._chargeableWithinLimit(),
+                coveredCounts: coveredCounts(),
+            };
         }
         const kept = batch ? rowsIn : rowsIn.slice(0, rows);
         if (kept.length < rowsIn.length) {
@@ -2171,10 +2259,12 @@ export async function pushDataWithCharges<T>({
             if (pushCertainlyFailed(pushErr)) await undo(ops);
             throw pushErr;
         }
+        logAtomicRefusal(shorts, rowsIn.length, kept.length, givenBack);
         return {
             eventChargeLimitReached: kept.length < rowsIn.length || chargingManager.isChargeLimitReached(),
             chargedCount: kept.length,
             chargeableWithinLimit: chargingManager._chargeableWithinLimit(),
+            coveredCounts: coveredCounts(),
         };
     });
 }
@@ -2198,6 +2288,8 @@ const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOST
 export function pushCertainlyFailed(err: unknown): boolean {
     for (let e: unknown = err, depth = 0; e && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
         if ((e as { outcomeUnknown?: unknown }).outcomeUnknown === true) return false;
+        // The server could not tell whether the push was stored (a 503 with this type).
+        if (apiErrorTypeOf(e) === 'push-outcome-unknown') return false;
     }
     if (isConnectFailure(err)) return true;
     for (let e: unknown = err, depth = 0; e && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {

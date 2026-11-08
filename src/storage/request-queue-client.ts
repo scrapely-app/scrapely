@@ -29,11 +29,36 @@ export interface ListRequestsResult {
 }
 import type { DragonflyClient } from './dragonfly-client.js';
 import type { RequestQueueOptions } from '@crawlee/types';
-import { uniqueKeyToRequestId, nowISO } from './utils.js';
+import { uniqueKeyToRequestId, nowISO, ownerNameField, releaseOwnerName } from './utils.js';
 import { BillingTracker } from './billing-tracker.js';
 import { listAndLockHeadAtomic, matchesLockOwner, unlockRequestsAtomic } from './rq-lock-script.js';
 import { listRequestsPage, type RequestQueueRequest } from './rq-list-requests.js';
+import { queueInheritExpiry } from './ttl-manager.js';
 import { randomUUID } from 'node:crypto';
+
+/**
+ * Lock owners are stored as "clientKey:runId", so a clientKey holding ':'
+ * could present another run's owner value. Same rule as the server.
+ */
+function assertClientKey(clientKey: string): string {
+    if (clientKey.includes(':')) throw new Error("clientKey must not contain ':'");
+    return clientKey;
+}
+
+/** Longest lock, in seconds (same as the server's MAX_LOCK_SECS). */
+export const MAX_LOCK_SECS = 86_400;
+
+/** lockSecs as a whole number of seconds from 1 to MAX_LOCK_SECS. */
+export function clampLockSecs(lockSecs: number): number {
+    const n = Math.floor(Number(lockSecs));
+    return Number.isFinite(n) ? Math.min(Math.max(n, 1), MAX_LOCK_SECS) : 1;
+}
+
+/**
+ * Largest stored request a head read loads (the server's MAX_READABLE_STORED_REQUEST_BYTES):
+ * a larger one is left out of the head instead of being read into memory.
+ */
+export const MAX_HEAD_REQUEST_BYTES = 10 * 1024 * 1024 + 64 * 1024;
 
 export class DragonflyRequestQueueClient implements RequestQueueClient {
     private infoKey: string;
@@ -44,7 +69,7 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
     private readonly clientKey: string;
 
     constructor(private client: DragonflyClient, private id: string, options?: RequestQueueOptions) {
-        this.clientKey = options?.clientKey || randomUUID().replace(/-/g, '').slice(0, 16);
+        this.clientKey = assertClientKey(options?.clientKey || randomUUID().replace(/-/g, '').slice(0, 16));
         this.infoKey = client.key('rq', id, 'info');
         this.requestsKey = client.key('rq', id, 'requests');
         this.pendingKey = client.key('rq', id, 'pending');
@@ -161,10 +186,12 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
             const raw = await this.client.redis.hget(indexKey, `id:${this.id}`);
             if (raw) {
                 const data = JSON.parse(raw);
-                if (data.name) await this.client.redis.hdel(indexKey, `name:${data.name}`);
+                // Name pointers are scoped by owner (name:{userId}:{name}).
+                const ownerId: string | undefined = data.userId ?? this.client.billingContext?.userId;
+                await releaseOwnerName(this.client.redis, indexKey, ownerId, data.name, this.id);
                 data.name = newFields.name;
                 await this.client.redis.hset(indexKey, `id:${this.id}`, JSON.stringify(data));
-                await this.client.redis.hset(indexKey, `name:${newFields.name}`, JSON.stringify(data));
+                if (ownerId && newFields.name) await this.client.redis.hset(indexKey, ownerNameField(ownerId, newFields.name), JSON.stringify(data));
             }
         }
         await this.client.redis.hset(this.infoKey, 'modifiedAt', nowISO().toISOString());
@@ -176,7 +203,7 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
         await this.client.redis.del(this.infoKey, this.requestsKey, this.pendingKey, this.lockedKey, this.lockOwnersKey);
         const indexKey = this.client.key('rq:index');
         await this.client.redis.hdel(indexKey, `id:${this.id}`);
-        if (info?.name) await this.client.redis.hdel(indexKey, `name:${info.name}`);
+        await releaseOwnerName(this.client.redis, indexKey, info?.userId || this.client.billingContext?.userId, info?.name, this.id);
     }
 
     async addRequest(request: RequestSchema, options?: RequestOptions): Promise<QueueOperationInfo> {
@@ -201,6 +228,8 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
         pipeline.hincrby(this.infoKey, 'totalRequestCount', 1);
         pipeline.hincrby(this.infoKey, 'pendingRequestCount', 1);
         pipeline.hset(this.infoKey, 'modifiedAt', nowISO().toISOString());
+        // Requests/pending are created by the first add: give them the queue's expiry.
+        queueInheritExpiry(pipeline, this.infoKey, [this.requestsKey, this.pendingKey]);
         await pipeline.exec();
 
         // Track write and storage bytes for billing
@@ -354,7 +383,7 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
 
         // Filter out locked items
         const items: RequestQueueHeadItem[] = [];
-        const candidates = ids.filter((id) => !activeLocks.has(id)).slice(0, limit);
+        const candidates = await this.withinHeadSize(ids.filter((id) => !activeLocks.has(id)).slice(0, limit));
         if (candidates.length > 0) {
             const raws = await this.client.redis.hmget(this.requestsKey, ...candidates);
             for (const raw of raws) {
@@ -483,11 +512,21 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
         return result;
     }
 
+    /** The ids whose stored request is at most MAX_HEAD_REQUEST_BYTES (HSTRLEN, nothing loaded). */
+    private async withinHeadSize(ids: string[]): Promise<string[]> {
+        if (ids.length === 0) return ids;
+        const pipeline = this.client.redis.pipeline();
+        for (const id of ids) pipeline.hstrlen(this.requestsKey, id);
+        const sizes = (await pipeline.exec()) ?? [];
+        return ids.filter((_, i) => Number(sizes[i]?.[1] ?? 0) <= MAX_HEAD_REQUEST_BYTES);
+    }
+
     async listAndLockHead(options: ListAndLockOptions & { clientKey?: string }): Promise<ListAndLockHeadResult> {
         const limit = Math.min(options.limit ?? 25, 25);
         const now = Date.now();
-        const lockUntil = now + options.lockSecs * 1000;
-        const clientKey = options.clientKey || this.clientKey;
+        const lockSecs = clampLockSecs(options.lockSecs);
+        const lockUntil = now + lockSecs * 1000;
+        const clientKey = assertClientKey(options.clientKey || this.clientKey);
 
         const runId = this.client.billingContext?.runId || null;
         const ownerValue = runId ? `${clientKey}:${runId}` : clientKey;
@@ -502,12 +541,20 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
             lockUntil,
             limit,
             ownerValue,
+            maxRequestBytes: MAX_HEAD_REQUEST_BYTES,
         });
 
         const items: RequestQueueHeadItem[] = [];
         if (lockedIds.length > 0) {
+            // The locked set and owners hash are created by the first lock: give them the queue's expiry.
+            const expiry = this.client.redis.pipeline();
+            queueInheritExpiry(expiry, this.infoKey, [this.lockedKey, this.lockOwnersKey]);
+            await expiry.exec();
+        }
+        const readable = await this.withinHeadSize(lockedIds);
+        if (readable.length > 0) {
             // Single HMGET instead of one HGET round-trip per locked ID
-            const raws = await this.client.redis.hmget(this.requestsKey, ...lockedIds);
+            const raws = await this.client.redis.hmget(this.requestsKey, ...readable);
             for (const raw of raws) {
                 if (!raw) continue;
                 const req = JSON.parse(raw);
@@ -533,7 +580,7 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
             limit,
             queueModifiedAt: modifiedAt ? new Date(modifiedAt) : nowISO(),
             hadMultipleClients,
-            lockSecs: options.lockSecs,
+            lockSecs,
             items,
             // From the atomic lock script: active locks held by ANY client
             // (including this call's own).
@@ -571,7 +618,7 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
             throw new Error(`Request with ID ${id} is not locked by this client in queue ${this.id}`);
         }
 
-        const lockUntil = now + options.lockSecs * 1000;
+        const lockUntil = now + clampLockSecs(options.lockSecs) * 1000;
         await this.client.redis.zadd(this.lockedKey, String(lockUntil), id);
         return { lockExpiresAt: new Date(lockUntil) };
     }
@@ -600,7 +647,7 @@ export class DragonflyRequestQueueClient implements RequestQueueClient {
             lockOwnersKey: this.lockOwnersKey,
             pendingKey: this.pendingKey,
         }, {
-            clientKey: options.clientKey,
+            clientKey: assertClientKey(options.clientKey),
             forefront: options.forefront,
             runId: options.runId,
         });
