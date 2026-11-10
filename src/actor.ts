@@ -38,6 +38,7 @@ import {
     type ChargeResult as ChargingChargeResult,
 } from './charging.js';
 import { pushDataWithCharges, truthfulStatusMessage } from './charging.js';
+import { getResumeDedupe } from './resume-dedupe.js';
 
 /** Options for a multi-event charged push (`Actor.pushData(row, { charges })`). */
 export interface PushDataChargeOptions {
@@ -1078,6 +1079,19 @@ export class Actor {
         }
 
         return this.pushDataWithExplicitCharging(dataset, item, eventName);
+    }
+
+    /**
+     * Name the field(s) that identify one result row (default `'id'`).
+     *
+     * When a run is resurrected or rebooted, the Actor's code starts again and
+     * often collects results it already saved. A charged push to the default
+     * dataset then skips rows whose key the run saved before: they are not saved
+     * or charged again, and count as accepted. Use an array for a key made of
+     * several fields (`['id', 'checkIn']`) and `null` to turn this off.
+     */
+    static setResultKey(key: string | string[] | null): void {
+        getResumeDedupe().setResultKey(key);
     }
 
     private usesPushDataInterception(dataset: Dataset): boolean {

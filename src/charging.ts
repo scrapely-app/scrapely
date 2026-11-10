@@ -9,6 +9,7 @@ import type { ApifyClient } from 'scrapely-client';
 import type { ActorRunPricingInfo } from 'scrapely-client';
 
 import type { Configuration } from './configuration.js';
+import { getResumeDedupe, type ResumeDedupeClient } from './resume-dedupe.js';
 import { apiRetryWindowMs, isConnectFailure, serverRetryDelayMs } from './storage/api-storage-client.js';
 
 /** Client safe-replay window; server TTL is longer (35d). */
@@ -690,6 +691,11 @@ export class ChargingManager {
     private chargingState?: Record<string, ChargingStateItem>;
     private chargingLogDataset?: { pushData: (data: Record<string, unknown>) => Promise<void> };
     private notPpeWarningPrinted = false;
+    /**
+     * Rows of a resumed run that the run had already saved (and paid for)
+     * before: not saved or charged again, but counted as accepted (event -> count).
+     */
+    private coveredEarlier: Record<string, number> = {};
     /** Idempotency key of the last charge the platform accepted (pushDataAndCharge void-on-failure). */
     private lastAcceptedOperationId: string | undefined;
     /** Voids not yet confirmed by the platform; retried before the next push and at exit. */
@@ -738,6 +744,23 @@ export class ChargingManager {
         const source = this.apifyClientSource;
         return typeof source === 'function' ? source() : source;
     }
+
+    /** @internal Serialize resumed-run dedupe plans with their pushes (outside the operation lock). */
+    async _withResumeDedupeLock<T>(operation: () => Promise<T>): Promise<T> {
+        const previous = this.resumeDedupeTail;
+        let release!: () => void;
+        this.resumeDedupeTail = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        await previous;
+        try {
+            return await operation();
+        } finally {
+            release();
+        }
+    }
+
+    private resumeDedupeTail: Promise<void> = Promise.resolve();
 
     /** @internal Serialize allowance calculation, side effects, and local reservation. */
     async _withOperationLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -903,14 +926,45 @@ export class ChargingManager {
     getChargedEventCount(eventName: string): number {
         this.ensureInitialized();
 
+        // Rows a resumed run had already saved count as charged: they were paid
+        // for when they were first saved (see resume-dedupe).
         if (isDefaultDatasetItemEvent(eventName)) {
             return (
                 (this.chargingState![APIFY_DEFAULT_DATASET_ITEM_EVENT]?.chargeCount ?? 0) +
-                (this.chargingState![SCRAPELY_DEFAULT_DATASET_ITEM_EVENT]?.chargeCount ?? 0)
+                (this.chargingState![SCRAPELY_DEFAULT_DATASET_ITEM_EVENT]?.chargeCount ?? 0) +
+                (this.coveredEarlier[APIFY_DEFAULT_DATASET_ITEM_EVENT] ?? 0) +
+                (this.coveredEarlier[SCRAPELY_DEFAULT_DATASET_ITEM_EVENT] ?? 0)
             );
         }
 
-        return this.chargingState![eventName]?.chargeCount ?? 0;
+        return (this.chargingState![eventName]?.chargeCount ?? 0) + (this.coveredEarlier[eventName] ?? 0);
+    }
+
+    /** @internal Rows skipped because the resumed run saved them before: count them as accepted. */
+    _noteCoveredEarlier(eventNames: string[], count: number): void {
+        if (count <= 0) return;
+        for (const name of new Set(eventNames)) {
+            if (name) this.coveredEarlier[name] = (this.coveredEarlier[name] ?? 0) + count;
+        }
+    }
+
+    /** @internal Events a default-dataset push charges per row (empty: not charged per row). */
+    _paidRowEventNames(charges: Record<string, number>): string[] {
+        if (!this._isPayPerEvent()) return [];
+        const names = [...Object.keys(charges), resolveDefaultDatasetItemEventName(this.pricingInfo)];
+        if (!names.some((name) => (this.calculateEventPrice(name) ?? 0) > 0)) return [];
+        return [...new Set(names)];
+    }
+
+    /** @internal What the resumed-run dedupe needs to read the run's saved rows. */
+    _resumeDedupeContext(): { client?: ResumeDedupeClient; runId?: string; datasetId?: string; isAtHome: boolean } {
+        let client: ResumeDedupeClient | undefined;
+        try {
+            client = this.apifyClient as unknown as ResumeDedupeClient;
+        } catch {
+            client = undefined;
+        }
+        return { client, runId: this.actorRunId || undefined, datasetId: defaultDatasetIdFromEnv(), isAtHome: this.isAtHome };
     }
 
     getMaxTotalChargeUsd(): number {
@@ -1758,7 +1812,7 @@ async function voidOrCredit(
     return 'voided';
 }
 
-export async function pushDataAndCharge<T>({
+async function pushDataAndChargeOnce<T>({
     chargingManager,
     items,
     eventName,
@@ -2117,7 +2171,7 @@ export function validateRowCharges(charges: unknown): Record<string, number> {
  * the rows that are kept, so no row is stored part-paid and no event is billed
  * for a row that was not stored. Unpriced events are ignored.
  */
-export async function pushDataWithCharges<T>({
+async function pushDataWithChargesOnce<T>({
     chargingManager,
     items,
     charges,
@@ -2306,4 +2360,81 @@ function apiErrorTypeOf(err: unknown): string | undefined {
     const e = err as { type?: unknown; data?: { error?: { type?: unknown } }; response?: { data?: { error?: { type?: unknown } } } } | undefined;
     const t = e?.type ?? e?.data?.error?.type ?? e?.response?.data?.error?.type;
     return typeof t === 'string' ? t : undefined;
+}
+
+type PushOpts<T> = {
+    chargingManager: ChargingManager;
+    items: T | T[];
+    eventName: string | undefined;
+    isDefaultDataset: boolean;
+    pushFn: (limitedItems: T | T[]) => Promise<void>;
+    validateItems?: (items: T[]) => void;
+};
+
+type ChargesPushOpts<T> = {
+    chargingManager: ChargingManager;
+    items: T | T[];
+    charges: Record<string, number>;
+    isDefaultDataset: boolean;
+    pushFn: (rows: T | T[]) => Promise<void>;
+    chargePer?: 'row' | 'batch';
+    validateItems?: (items: T[]) => void;
+};
+
+/**
+ * A charged default-dataset push of a resumed run: rows the run saved before
+ * are skipped (see resume-dedupe). A skipped row is neither stored nor charged;
+ * it counts as accepted in the result and in getChargedEventCount.
+ */
+async function skipSavedRows<T>(
+    chargingManager: ChargingManager,
+    items: T | T[],
+    eventNames: string[],
+    push: (items: T | T[]) => Promise<ChargeResult>,
+): Promise<ChargeResult> {
+    const dedupe = getResumeDedupe();
+    if (!(await dedupe.ensure(chargingManager._resumeDedupeContext()))) return push(items);
+    const single = !Array.isArray(items);
+    const rows = Array.isArray(items) ? items : [items];
+    // JS runs one push plan at a time between awaits; the operation lock keeps
+    // pushes in order, so plan and commit see the pushes one after another.
+    return chargingManager._withResumeDedupeLock(async () => {
+        const { kept, skipped, pushed } = dedupe.plan(rows);
+        if (skipped.length === 0) {
+            const result = await push(single && kept.length === 1 ? kept[0] : kept);
+            dedupe.commit([], pushed.slice(0, Math.max(0, result.chargedCount)));
+            return result;
+        }
+        const result: ChargeResult = kept.length > 0
+            ? await push(single && kept.length === 1 ? kept[0] : kept)
+            : {
+                eventChargeLimitReached: chargingManager.isChargeLimitReached?.() ?? false,
+                chargedCount: 0,
+                chargeableWithinLimit: chargingManager._chargeableWithinLimit?.() ?? {},
+            };
+        const n = dedupe.commit(skipped, pushed.slice(0, Math.max(0, result.chargedCount)));
+        chargingManager._noteCoveredEarlier(eventNames, n);
+        return { ...result, chargedCount: result.chargedCount + n };
+    });
+}
+
+export async function pushDataAndCharge<T>(opts: PushOpts<T>): Promise<ChargeResult> {
+    const { chargingManager, items, eventName, isDefaultDataset } = opts;
+    const count = Array.isArray(items) ? items.length : 1;
+    const paid = isDefaultDataset && count > 0 && typeof chargingManager._paidRowEventNames === 'function'
+        ? chargingManager._paidRowEventNames(eventName ? { [eventName]: 1 } : {})
+        : [];
+    if (paid.length === 0) return pushDataAndChargeOnce(opts);
+    return skipSavedRows(chargingManager, items, paid, (rows) => pushDataAndChargeOnce({ ...opts, items: rows }));
+}
+
+export async function pushDataWithCharges<T>(opts: ChargesPushOpts<T>): Promise<ChargeResult> {
+    const { chargingManager, items, charges, isDefaultDataset, chargePer = 'row' } = opts;
+    const count = Array.isArray(items) ? items.length : 1;
+    const paid = chargePer === 'row' && isDefaultDataset && count > 0 && charges && typeof charges === 'object'
+        && typeof chargingManager._paidRowEventNames === 'function'
+        ? chargingManager._paidRowEventNames(charges)
+        : [];
+    if (paid.length === 0) return pushDataWithChargesOnce(opts);
+    return skipSavedRows(chargingManager, items, paid, (rows) => pushDataWithChargesOnce({ ...opts, items: rows }));
 }

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.42] - 2026-11-10
+
+- **A resurrected or rebooted run no longer charges again for results it had already saved.** Such a run keeps its default dataset, but the Actor's code starts from the beginning, and an Actor without its own progress state collects the results it saved before once more. On the first charged push to the default dataset of such a run, the SDK reads the result key of the rows already saved (one read of the dataset's `id` values; `id` by default). A charged row whose key is one of them is not saved and not charged again: the dataset already holds it and it was paid for when it was first saved. It counts as accepted in the push result (`chargedCount`) and in `getChargedEventCount()`, so Actors that compare pushed and charged counts do not stop. The run's spending limit is not used by these rows.
+  - `Actor.setResultKey('id' | ['id', 'checkIn'] | null)` names the field(s) that identify one result row; `null` turns this off. `SCRAPELY_RESUME_DEDUPE=off` turns it off for a run.
+  - Nothing changes when the key does not identify a row: if the saved rows repeat a key, or the resumed run pushes one key twice (for example the same result from two different searches), every row is saved and charged as before. Nothing changes in a first run, a run that saved nothing yet, after a metamorph, for rows without the key, for named datasets or for pushes that are not charged per row. A first run reads only the dataset's item count once.
+
 ## [1.2.41] - 2026-11-08
 
 - An atomic multi-event push (`Actor.pushData(rows, { charges })`) whose charge the limit covers only in part no longer logs "Charging 5 instances of 'audio-minute' event would exceed the end of the account balance - only 3 events were charged". A row is saved only when all of its events are charged, so the SDK gives those 3 back and nothing is charged: the line was untrue. It now says what happened: "Saving this item needs 5 'audio-minute' event(s), but the account balance covers only 3: it was not saved and nothing was charged for it." When some rows still fit, it names how many were saved and charged in full, and when giving a charge back is not confirmed it says so instead of "nothing was charged". A plain `Actor.charge()` that comes back short keeps its line: those events do stay charged.
