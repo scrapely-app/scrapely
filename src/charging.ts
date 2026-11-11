@@ -2399,10 +2399,22 @@ async function skipSavedRows<T>(
     // JS runs one push plan at a time between awaits; the operation lock keeps
     // pushes in order, so plan and commit see the pushes one after another.
     return chargingManager._withResumeDedupeLock(async () => {
-        const { kept, skipped, pushed } = dedupe.plan(rows);
-        if (skipped.length === 0) {
+        const plan = dedupe.plan(rows);
+        let { kept, pushed } = plan;
+        const { skipped } = plan;
+        // The Actor's declared run-level limit counts the rows saved before.
+        const room = dedupe.remaining();
+        const capped = room !== undefined && kept.length > room;
+        if (capped) {
+            kept = kept.slice(0, room);
+            pushed = pushed.slice(0, room);
+            dedupe.noteCapped();
+        }
+        if (skipped.length === 0 && !capped) {
             const result = await push(single && kept.length === 1 ? kept[0] : kept);
-            dedupe.commit([], pushed.slice(0, Math.max(0, result.chargedCount)));
+            const stored = Math.max(0, result.chargedCount);
+            dedupe.commit([], pushed.slice(0, stored));
+            dedupe.noteNewRows(stored);
             return result;
         }
         const result: ChargeResult = kept.length > 0
@@ -2412,9 +2424,11 @@ async function skipSavedRows<T>(
                 chargedCount: 0,
                 chargeableWithinLimit: chargingManager._chargeableWithinLimit?.() ?? {},
             };
-        const n = dedupe.commit(skipped, pushed.slice(0, Math.max(0, result.chargedCount)));
+        const stored = Math.max(0, result.chargedCount);
+        const n = dedupe.commit(skipped, pushed.slice(0, stored));
+        dedupe.noteNewRows(stored);
         chargingManager._noteCoveredEarlier(eventNames, n);
-        return { ...result, chargedCount: result.chargedCount + n };
+        return { ...result, chargedCount: result.chargedCount + n, eventChargeLimitReached: result.eventChargeLimitReached || capped };
     });
 }
 

@@ -18,6 +18,13 @@
  * pushes one key twice, it does not, and the run goes on as before: every row
  * is stored and charged. Nothing is skipped in a first run, in a run that saved
  * nothing yet, after a metamorph, or for pushes that are not charged per row.
+ *
+ * A resumed generation also starts the Actor's own result count from zero. An
+ * Actor that declares its run-level result limit (`Actor.setResultLimit(n)`,
+ * e.g. its `maxItems` input) gets it applied across generations: once the rows
+ * saved before plus the new rows of this generation reach `n`, further charged
+ * rows are refused like at the spending limit (not stored, not charged, and the
+ * push reports the limit), so the run ends with `n` results, not more.
  */
 export const MAX_SAVED_ROWS = 200_000;
 const PAGE = 5_000;
@@ -69,6 +76,40 @@ export class ResumeDedupe {
     private skippedTotal = 0;
     private announced = false;
     private loading?: Promise<void>;
+    /** Run-level result limit the Actor declared (undefined: not declared). */
+    private limit?: number;
+    /** Rows the default dataset held when this resumed generation started (undefined: not a resumed run). */
+    private resumedRows?: number;
+    /** New rows this generation stored through charged pushes. */
+    private newRows = 0;
+    private limitAnnounced = false;
+
+    setResultLimit(limit: number | null | undefined): void {
+        if (limit === null || limit === undefined) {
+            this.limit = undefined;
+            return;
+        }
+        if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1) {
+            throw new Error('result limit must be a positive integer or null');
+        }
+        this.limit = limit;
+    }
+
+    /** New rows this resumed generation may still store under the declared limit (undefined: no cap). */
+    remaining(): number | undefined {
+        if (this.limit === undefined || this.resumedRows === undefined) return undefined;
+        return Math.max(0, this.limit - this.resumedRows - this.newRows);
+    }
+
+    noteNewRows(count: number): void {
+        if (count > 0) this.newRows += count;
+    }
+
+    noteCapped(): void {
+        if (this.limitAnnounced) return;
+        this.limitAnnounced = true;
+        console.log(`[Scrapely] This run was resumed with ${this.resumedRows} results saved before; it stops at its limit of ${this.limit} results`);
+    }
 
     setResultKey(key: string | string[] | null | undefined): void {
         const fields = normalizeKey(key);
@@ -97,8 +138,8 @@ export class ResumeDedupe {
     private async load(opts: { client?: ResumeDedupeClient; runId?: string; datasetId?: string; isAtHome: boolean }): Promise<void> {
         this.state = 'off';
         const fields = this.fields;
-        if (!fields) return;
         if (OFF_VALUES.has((process.env.SCRAPELY_RESUME_DEDUPE ?? '').trim().toLowerCase())) return;
+        if (!fields && this.limit === undefined) return;
         const { client, runId, datasetId, isAtHome } = opts;
         if (!isAtHome || !client || !runId || !datasetId) return;
         const saved = new Set<Key>();
@@ -110,6 +151,8 @@ export class ResumeDedupe {
             const stats = run?.stats ?? {};
             const resumed = (Number(stats.resurrectCount) || 0) + (Number(stats.rebootCount) || 0);
             if (resumed <= 0 || (Number(stats.metamorph) || 0) > 0) return;
+            this.resumedRows = itemCount;
+            if (!fields) return; // no result key: only the declared limit applies
             if (itemCount > MAX_SAVED_ROWS) {
                 console.log(
                     `[Scrapely] This run was resumed with ${itemCount} saved results, more than the ${MAX_SAVED_ROWS} the SDK reads `
@@ -149,7 +192,7 @@ export class ResumeDedupe {
             this.loading ??= this.load(opts).finally(() => { this.loading = undefined; });
             await this.loading;
         }
-        return this.state === 'on';
+        return this.state === 'on' || this.remaining() !== undefined;
     }
 
     /** Split rows into rows to push, keys of skipped rows, and the key of each row to push. Nothing is recorded yet. */

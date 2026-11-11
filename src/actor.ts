@@ -1082,6 +1082,20 @@ export class Actor {
     }
 
     /**
+     * Declare the Actor's run-level result limit (e.g. its `maxItems` input).
+     *
+     * A resurrected or rebooted run starts the Actor's code again, and with it the
+     * Actor's own result count. With a declared limit, the rows the run saved before
+     * count towards it: once they and the new rows of the resumed run reach `limit`,
+     * further charged rows are refused like at the spending limit (not saved, not
+     * charged, the push reports the limit). Only declare a limit that counts all
+     * results of the run, not one per search. `null` removes it.
+     */
+    static setResultLimit(limit: number | null): void {
+        getResumeDedupe().setResultLimit(limit);
+    }
+
+    /**
      * Name the field(s) that identify one result row (default `'id'`).
      *
      * When a run is resurrected or rebooted, the Actor's code starts again and
