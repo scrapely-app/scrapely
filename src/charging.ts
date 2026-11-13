@@ -281,6 +281,9 @@ function isSyntheticEvent(eventName: string): boolean {
     return isDefaultDatasetItemEvent(eventName);
 }
 
+/** The actor-start events the platform bills by itself (never an item the run saved). */
+const PLATFORM_START_EVENTS = new Set(['scrapely-actor-start', 'apify-actor-start']);
+
 
 export interface ChargeOptions {
     eventName: string;
@@ -524,7 +527,11 @@ export class ChargingManager {
         if (
             maxItems !== undefined &&
             Object.entries(this.chargingState ?? {}).some(
-                ([name, state]) => !isSyntheticEvent(name) && (this.pricingInfo[name]?.price ?? 0) > 0 && state.chargeCount >= maxItems,
+                ([name, state]) =>
+                    !isSyntheticEvent(name) &&
+                    !PLATFORM_START_EVENTS.has(name) &&
+                    (this.pricingInfo[name]?.price ?? 0) > 0 &&
+                    state.chargeCount >= maxItems,
             )
         ) {
             return 'max-items';

@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.44] - 2026-11-13
+
+- Maintenance release.
+
 ## [1.2.43] - 2026-11-10
 
 - **A resurrected or rebooted run stops at the Actor's own result limit.** A resumed run starts the Actor's code again, and with it the Actor's own result count, so an Actor whose source returns results in a different order each run (search pages, feeds) could end with more results than its limit: with `maxResults` 60, 24 rows saved before the abort plus the resumed run's own 60 (some of them saved before and skipped) gave 67. `Actor.setResultLimit(n)` declares the Actor's run-level result limit, e.g. its `maxItems` input. In a resumed run the rows saved before count towards it: once they and the new rows reach `n`, further charged rows are refused like at the spending limit (not saved, not charged, the push reports the limit), so the run ends with `n` results. Declare only a limit that counts all results of the run, not one per search. Nothing changes in a first run or for Actors that do not declare a limit.
