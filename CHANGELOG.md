@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.45] - 2026-11-13
+
+- **A charge accepted in full no longer reports the limit as reached.** `ChargeResult.eventChargeLimitReached` (from `Actor.charge()`, `Actor.pushData()` and `pushData(rows, { charges })`) was `true` whenever the room left under `maxTotalChargeUsd` was below one more event, even when nothing had been refused. Actors stop on it and end with "stopped because the maximum charge for this run was reached", which the SDK words as "Stopped: reached the maximum charge you set ($0.05)", so a run that had saved everything it was asked for said it had been stopped by its maximum charge. It is now `true` only once the limit really refused or cut a charge or dropped rows; such a run ends with its own status message, and a run with more to do gets `true` from its next charge or push, which is refused. A charged push to a named dataset that the budget trims now also reports it. `chargeableWithinLimit`, `calculateMaxEventChargeCountWithinLimit()` and `isChargeLimitReached()` are unchanged. Charging is unchanged.
+
 ## [1.2.44] - 2026-11-13
 
 - Maintenance release.

@@ -291,6 +291,13 @@ export interface ChargeOptions {
 }
 
 export interface ChargeResult {
+    /**
+     * True when a limit of the run (maxTotalChargeUsd, maxItems, the account
+     * balance) refused or cut a charge or dropped rows, and no more events of
+     * this type can be charged: stop. A charge accepted in full that leaves less
+     * than one more event of room reports false (the next charge or push is
+     * refused and reports true); `chargeableWithinLimit` tells the room left.
+     */
     eventChargeLimitReached: boolean;
     chargedCount: number;
     chargeableWithinLimit: Record<string, number>;
@@ -583,6 +590,7 @@ export class ChargingManager {
     /** @internal Count rows dropped because of the limit; warn on the first one only. */
     _noteRefusedDefaultDatasetItems(count: number): void {
         if (count <= 0) return;
+        this.markChargeLimitHit();
         if (this.refusedDefaultDatasetItems === 0) {
             const name = this.limitName();
             console.warn(
@@ -597,6 +605,26 @@ export class ChargingManager {
     /** @internal `reason`: the limit that trimmed the push, when known. */
     _markChargeLimitHit(reason?: ChargeLimitReason): void {
         this.markChargeLimitHit(reason);
+    }
+
+    /**
+     * @internal `eventChargeLimitReached` for a charge or push that the limit did not cut.
+     *
+     * True only once a limit of this run really refused or cut a charge or
+     * dropped rows, and (for `eventName`) not one more such event fits. A
+     * charge accepted in full that leaves less than one more event of room
+     * reports false: the run has not been stopped by its limit, and an Actor
+     * that already has everything it was asked for ends with its own status
+     * message instead of "stopped because the maximum charge was reached". If
+     * it does go on, its next charge or push is refused, and that result
+     * reports true. `chargeableWithinLimit`,
+     * `calculateMaxEventChargeCountWithinLimit()` and `isChargeLimitReached()`
+     * still tell how much room is left.
+     */
+    _limitReported(eventName?: string): boolean {
+        if (!this.chargeLimitHit) return false;
+        if (eventName === undefined) return true;
+        return this.calculateMaxEventChargeCountWithinLimit(eventName) <= 0;
     }
 
     /** @internal Whether every row of a push with these events is charged a positive price. */
@@ -1694,7 +1722,7 @@ export class ChargingManager {
         }
 
         return {
-            eventChargeLimitReached: this.calculateMaxEventChargeCountWithinLimit(normalizedEventName) <= 0,
+            eventChargeLimitReached: chargedCount < count || this._limitReported(normalizedEventName),
             chargedCount,
             chargeableWithinLimit: calculateChargeableWithinLimit(),
         };
@@ -1709,6 +1737,13 @@ export class ChargingManager {
  * 2. Push limited items via the provided callback
  * 3. Charge for the events
  */
+
+/** `eventChargeLimitReached` for a push the limit did not cut (see ChargingManager._limitReported). */
+function limitReported(manager: { _limitReported?: () => boolean; isChargeLimitReached?: () => boolean }): boolean {
+    // Partial managers (tests, older shims) keep the room-based answer.
+    if (typeof manager._limitReported === 'function') return manager._limitReported();
+    return manager.isChargeLimitReached?.() ?? false;
+}
 
 function extractChargeResponseBody(response: unknown): Record<string, unknown> {
     if (!response || typeof response !== 'object') return {};
@@ -1849,7 +1884,8 @@ async function pushDataAndChargeOnce<T>({
         // stores only the rows that are actually charged.
         // Rows the Actor already paid for with an earlier charge() (charge first,
         // then a plain push) are still stored: see ChargingManager._takeUnpaidRows.
-        // The result still reports the limit, so the Actor stops after them.
+        // The result reports the limit once it refused something (these rows or
+        // an earlier charge), so the Actor stops after them; see _limitReported.
         let unpaidPastLimit = false;
         if (
             isDefaultDataset &&
@@ -1858,7 +1894,6 @@ async function pushDataAndChargeOnce<T>({
             chargingManager._isPayPerEvent?.() === true &&
             !chargingManager._isPaidPerItem?.(eventName, isDefaultDataset)
         ) {
-            unpaidPastLimit = chargingManager.isChargeLimitReached?.() ?? false;
             const allowed = chargingManager._takeUnpaidRows(requested);
             if (allowed < requested) {
                 chargingManager._noteRefusedDefaultDatasetItems(requested - allowed);
@@ -1871,6 +1906,7 @@ async function pushDataAndChargeOnce<T>({
                 }
                 items = (Array.isArray(items) ? items.slice(0, allowed) : items) as T | T[];
             }
+            unpaidPastLimit = limitReported(chargingManager);
         }
         const { limitedItems, eventsToCharge } = chargingManager.calculatePushDataLimits({
             items,
@@ -1890,10 +1926,10 @@ async function pushDataAndChargeOnce<T>({
 
         const itemsArray = Array.isArray(items) ? items : [items];
         const allItemsTrimmed = itemsArray.length > 0 && limitedItems.length === 0;
-        if (isDefaultDataset && limitedItems.length < itemsArray.length) {
-            // Rows beyond what the budget can pay for are dropped.
+        if (limitedItems.length < itemsArray.length) {
+            // Rows beyond what the budget can pay for are dropped (any dataset).
             chargingManager._markChargeLimitHit?.('max-charge');
-            chargingManager._noteRefusedDefaultDatasetItems?.(itemsArray.length - limitedItems.length);
+            if (isDefaultDataset) chargingManager._noteRefusedDefaultDatasetItems?.(itemsArray.length - limitedItems.length);
         }
 
         if (limitedItems.length === 0) {
@@ -2217,9 +2253,9 @@ async function pushDataWithChargesOnce<T>({
         let { perRow, rows } = chargingManager._rowCharges(perRowIn, isDefaultDataset, rowsIn.length, batch);
         if (Object.keys(perRow).length === 0) {
             // Only free events: an unpaid push (prepaid-row rules apply).
-            const pastLimit = chargingManager.isChargeLimitReached();
             const allowed = isDefaultDataset ? chargingManager._takeUnpaidRows(rowsIn.length) : rowsIn.length;
             if (allowed < rowsIn.length) chargingManager._noteRefusedDefaultDatasetItems(rowsIn.length - allowed);
+            const pastLimit = limitReported(chargingManager);
             if (allowed > 0) await store(rowsIn.slice(0, allowed));
             return { eventChargeLimitReached: pastLimit, chargedCount: 0, chargeableWithinLimit: chargingManager._chargeableWithinLimit() };
         }
@@ -2322,7 +2358,7 @@ async function pushDataWithChargesOnce<T>({
         }
         logAtomicRefusal(shorts, rowsIn.length, kept.length, givenBack);
         return {
-            eventChargeLimitReached: kept.length < rowsIn.length || chargingManager.isChargeLimitReached(),
+            eventChargeLimitReached: kept.length < rowsIn.length || limitReported(chargingManager),
             chargedCount: kept.length,
             chargeableWithinLimit: chargingManager._chargeableWithinLimit(),
             coveredCounts: coveredCounts(),
@@ -2427,7 +2463,7 @@ async function skipSavedRows<T>(
         const result: ChargeResult = kept.length > 0
             ? await push(single && kept.length === 1 ? kept[0] : kept)
             : {
-                eventChargeLimitReached: chargingManager.isChargeLimitReached?.() ?? false,
+                eventChargeLimitReached: limitReported(chargingManager),
                 chargedCount: 0,
                 chargeableWithinLimit: chargingManager._chargeableWithinLimit?.() ?? {},
             };
