@@ -2148,11 +2148,10 @@ async function pushDataAndChargeOnce<T>({
                     `[Scrapely] Dataset push failed after charge accepted ` +
                         `(items=${acceptedForItems}): ${(pushErr as Error).message}; voiding the charge`,
                 );
-                // Only when the push certainly stored nothing: the storage API
-                // answered with an error, or the connection was never made. A
-                // timeout or reset after sending may have stored the items, so
-                // the charge stands for those (they may be in the dataset).
-                if (!pushCertainlyFailed(pushErr)) throw pushErr;
+                // Every failed push is voided, also a timeout, a reset after sending
+                // or an unknown outcome (pushCertainlyFailed false): the rows may be
+                // in the dataset, but a user is never charged for rows that may not
+                // have been stored (possibly-free rows are the platform's cost).
                 for (let i = 0; i < reservedInOp.length; i++) {
                     const entry = reservedInOp[i]!;
                     const { name, operationId, uncertain } = entry;
@@ -2353,7 +2352,9 @@ async function pushDataWithChargesOnce<T>({
             await store(kept);
         } catch (pushErr) {
             console.error(`[Scrapely] Dataset push failed after charges accepted (rows=${kept.length}): ${(pushErr as Error).message}; voiding the charges`);
-            if (pushCertainlyFailed(pushErr)) await undo(ops);
+            // Voided also when the outcome is unknown (timeout, reset after sending,
+            // 'push-outcome-unknown'): never charge for rows that may not be stored.
+            await undo(ops);
             throw pushErr;
         }
         logAtomicRefusal(shorts, rowsIn.length, kept.length, givenBack);
@@ -2381,6 +2382,7 @@ const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOST
  * resets after the request was sent are not proof (the write may have landed),
  * and neither is any error of a push one of whose earlier attempts may have
  * been applied (`outcomeUnknown`, set by the storage client's retries).
+ * Charging does not use it: a failed push is voided either way.
  */
 export function pushCertainlyFailed(err: unknown): boolean {
     for (let e: unknown = err, depth = 0; e && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
