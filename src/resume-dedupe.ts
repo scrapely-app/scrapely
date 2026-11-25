@@ -14,6 +14,12 @@
  * in `getChargedEventCount`, so Actors that compare what they pushed with what
  * was charged do not read it as a refused charge.
  *
+ * When the Actor names no key and its saved rows carry no `id`, the SDK uses the
+ * fields of the saved rows whose name ends in `Id` or `_id` (`reviewId`,
+ * `place_id`) and that hold a different value in every saved row, together as
+ * one key. Rows of a Google Maps review search carry `reviewId`, not `id`: a
+ * resurrected run of it collected and charged again 3,720 reviews it had saved.
+ *
  * The key must identify a row. When the saved rows repeat a key, or this run
  * pushes one key twice, it does not, and the run goes on as before: every row
  * is stored and charged. Nothing is skipped in a first run, in a run that saved
@@ -29,6 +35,9 @@
 export const MAX_SAVED_ROWS = 200_000;
 const PAGE = 5_000;
 const OFF_VALUES = new Set(['0', 'off', 'false', 'no']);
+/** Saved rows read in full to find a key when the Actor named none and the rows carry no `id`. */
+export const AUTO_KEY_SAMPLE = 1_000;
+const ID_FIELD = /(?:[a-z0-9](?:Id|ID)|_id)$/;
 
 type Key = string;
 
@@ -59,6 +68,43 @@ export function rowKey(row: unknown, fields: string[]): Key | undefined {
     return JSON.stringify(parts);
 }
 
+/** The id fields (`...Id` / `..._id`) with a usable, different value in every row, or null. */
+export function detectResultKey(rows: unknown[]): string[] | null {
+    const objs = rows.filter((r): r is Record<string, unknown> => !!r && typeof r === 'object' && !Array.isArray(r));
+    if (objs.length < 2) return null;
+    const names = [...new Set(objs.flatMap((r) => Object.keys(r).filter((n) => ID_FIELD.test(n))))].sort();
+    const chosen: string[] = [];
+    for (const name of names) {
+        const values = objs.map((r) => scalar(r[name]));
+        if (values.some((v) => v === undefined)) continue;
+        if (new Set(values).size !== values.length) continue;
+        chosen.push(name);
+    }
+    return chosen.length > 0 ? chosen : null;
+}
+
+/** Keys of the saved rows and how many rows had one; null when a key repeats. */
+async function readKeys(client: ResumeDedupeClient, datasetId: string, itemCount: number, fields: string[]): Promise<{ saved: Set<Key>; keyed: number } | null> {
+    const saved = new Set<Key>();
+    let keyed = 0;
+    let offset = 0;
+    while (offset < itemCount) {
+        const page = await client.dataset(datasetId).listItems({ fields, offset, limit: PAGE });
+        const rows = page?.items ?? [];
+        if (rows.length === 0) break;
+        for (const row of rows) {
+            const key = rowKey(row, fields);
+            if (key === undefined) continue;
+            keyed++;
+            // Saved rows repeat their result key: it does not identify a row.
+            if (saved.has(key)) return null;
+            saved.add(key);
+        }
+        offset += rows.length;
+    }
+    return { saved, keyed };
+}
+
 function normalizeKey(key: string | string[] | null | undefined): string[] | null {
     if (key === null || key === undefined) return null;
     const names = typeof key === 'string' ? [key] : [...key];
@@ -70,6 +116,8 @@ function normalizeKey(key: string | string[] | null | undefined): string[] | nul
 
 export class ResumeDedupe {
     private fields: string[] | null = ['id'];
+    /** True once the Actor named its key (setResultKey): no key is guessed then. */
+    private explicit = false;
     private state: 'unknown' | 'on' | 'off' = 'unknown';
     private saved = new Set<Key>();
     private seen = new Set<Key>();
@@ -113,6 +161,7 @@ export class ResumeDedupe {
 
     setResultKey(key: string | string[] | null | undefined): void {
         const fields = normalizeKey(key);
+        this.explicit = true;
         if (JSON.stringify(fields) === JSON.stringify(this.fields)) return;
         this.fields = fields;
         if (this.state === 'on') {
@@ -142,7 +191,7 @@ export class ResumeDedupe {
         if (!fields && this.limit === undefined) return;
         const { client, runId, datasetId, isAtHome } = opts;
         if (!isAtHome || !client || !runId || !datasetId) return;
-        const saved = new Set<Key>();
+        let saved = new Set<Key>();
         try {
             const info = await client.dataset(datasetId).get();
             const itemCount = Number(info?.itemCount ?? 0) || 0;
@@ -160,22 +209,21 @@ export class ResumeDedupe {
                 );
                 return;
             }
-            let keyed = 0;
-            let offset = 0;
-            while (offset < itemCount) {
-                const page = await client.dataset(datasetId).listItems({ fields, offset, limit: PAGE });
-                const rows = page?.items ?? [];
-                if (rows.length === 0) break;
-                for (const row of rows) {
-                    const key = rowKey(row, fields);
-                    if (key === undefined) continue;
-                    keyed++;
-                    // Saved rows repeat their result key: it does not identify a row.
-                    if (saved.has(key)) return;
-                    saved.add(key);
-                }
-                offset += rows.length;
+            let keys = await readKeys(client, datasetId, itemCount, fields);
+            if (!keys) return;
+            if (keys.keyed === 0 && !this.explicit) {
+                // No saved row has an `id`: use the saved rows' own id fields.
+                const sample = await client.dataset(datasetId).listItems({ offset: 0, limit: AUTO_KEY_SAMPLE });
+                const found = detectResultKey(sample?.items ?? []);
+                if (!found) return;
+                keys = await readKeys(client, datasetId, itemCount, found);
+                // A found key must be in every saved row.
+                if (!keys || keys.keyed !== itemCount) return;
+                this.fields = found;
+                console.log(`[Scrapely] This run was resumed: its saved results are told apart by ${found.map((f) => `'${f}'`).join(' + ')}`);
             }
+            saved = keys.saved;
+            const keyed = keys.keyed;
             if (keyed < 2) return;
         } catch {
             // Could not read the saved rows: every row is saved and charged as before.

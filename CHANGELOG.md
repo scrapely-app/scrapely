@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.47] - 2026-11-25
+
+- **A resumed run's rows without `id` are not charged again either.** When a resurrected or rebooted run's saved rows have no `id` and the Actor named no key (`Actor.setResultKey`), the SDK now tells them apart by the saved rows' own id fields: the fields whose name ends in `Id` or `_id` (`reviewId`, `place_id`) and that differ in every saved row, together. A charged row whose values of those fields were already saved is not saved or charged again. Before, such rows were all saved and charged a second time (a resurrected Google Maps reviews run: 3,720 of its 3,787 reviews). Nothing changes when no such field identifies every saved row, when the Actor named its key, or in a run that was not resumed.
+
 ## [1.2.46] - 2026-11-18
 
 - **A charged push that fails is always voided.** `Actor.pushData(items, eventName)` and `pushData(rows, { charges })` charge before the push; when the push then fails, its charge is now voided also when the outcome is unknown: a timeout or dropped connection after sending, an error after a re-send that may have been stored, or the API's `503 push-outcome-unknown`. Before, the charge stood in those cases because the rows might be in the dataset. A user is now never charged for rows that may not have been stored; rows that were stored anyway are free. Pushes that succeed are charged exactly as before.
